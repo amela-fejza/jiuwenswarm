@@ -711,6 +711,9 @@ class TeamManager:
             The enriched ``TeamAgentSpec`` ready to build (``build_context`` set;
             assembly is fully declarative, no imperative post-processing).
         """
+        from jiuwenswarm.agents.harness.team.topology import (
+            apply_team_routing_to_spec,
+        )
         from jiuwenswarm.agents.swarm import enrich_team_spec_for_swarm
 
         config_base = get_config()
@@ -722,6 +725,9 @@ class TeamManager:
         if not has_binding:
             self._apply_session_scoped_team_name(spec, session_id=session_id)
         self.apply_team_plan_mode(spec, request_metadata=request_metadata)
+        routing_decision = (request_metadata or {}).get("team_routing")
+        if isinstance(routing_decision, dict):
+            apply_team_routing_to_spec(spec, routing_decision)
         enrich_team_spec_for_swarm(
             spec,
             session_id=session_id,

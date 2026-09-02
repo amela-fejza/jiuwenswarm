@@ -1522,6 +1522,37 @@ async def process_team_message_stream(
             if isinstance(params_obj, dict)
             else ""
         ) or None
+        try:
+            from jiuwenswarm.agents.harness.team.topology import (
+                build_team_routing_prompt,
+                load_team_routing_config,
+                route_team_query,
+            )
+
+            team_routing_config = load_team_routing_config()
+            team_routing_decision = route_team_query(query_text, team_routing_config)
+            if team_routing_decision is not None:
+                routing_payload = team_routing_decision.to_dict()
+                request_metadata["team_routing"] = routing_payload
+                request.metadata = request_metadata
+                query = build_team_routing_prompt(str(query), team_routing_decision)
+                logger.info(
+                    "[TeamRouting] selected topology=%s roles=%s "
+                    "confidence=%.3f fallback=%s request_id=%s session_id=%s",
+                    team_routing_decision.topology,
+                    list(team_routing_decision.roles),
+                    team_routing_decision.confidence,
+                    team_routing_decision.fallback_reason or "none",
+                    rid,
+                    session_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[TeamRouting] routing failed; preserving configured team "
+                "behavior: request_id=%s error=%s",
+                rid,
+                type(exc).__name__,
+            )
         # Provider-based assembly: build members from the shared config source,
         # no pre-built parent DeepAgent required.
         team_spec = await team_manager.get_swarm_enriched_team_spec(

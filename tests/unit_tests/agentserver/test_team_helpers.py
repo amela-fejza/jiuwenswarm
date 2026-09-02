@@ -1516,6 +1516,64 @@ async def test_process_team_message_stream_emits_deferred_marker_for_followup(mo
 
 
 @pytest.mark.anyio
+async def test_team_routing_replans_followup_without_replacing_session(
+    monkeypatch,
+):
+    class _FakeManager(_InactiveTeamRuntimeManagerMixin):
+        interact_calls: list[tuple[str, str]] = []
+        routing_metadata: dict[str, Any] = {}
+
+        @staticmethod
+        def has_stream_task(session_id: str) -> bool:
+            assert session_id == "sess-team-routed-followup"
+            return True
+
+        @classmethod
+        async def get_swarm_enriched_team_spec(cls, **kwargs):
+            cls.routing_metadata = kwargs["request_metadata"]
+            return SimpleNamespace(team_name="unit-team")
+
+        @classmethod
+        async def interact(cls, session_id: str, query: str):
+            cls.interact_calls.append((session_id, query))
+            return True, None
+
+    monkeypatch.setattr(
+        team_helpers,
+        "get_team_manager",
+        lambda channel_id: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.common.config.get_config",
+        lambda: {"team_routing": {"enabled": True}},
+    )
+    request = SimpleNamespace(
+        session_id="sess-team-routed-followup",
+        request_id="req-team-routed-followup",
+        channel_id="web",
+        metadata=None,
+        params={"mode": "team"},
+    )
+
+    chunks = [
+        chunk
+        async for chunk in team_helpers.process_team_message_stream(
+            request,
+            {"query": "Implement multiple independent components in parallel"},
+            object(),
+        )
+    ]
+
+    assert request.params["mode"] == "team"
+    assert _FakeManager.routing_metadata["team_routing"]["topology"] == "parallel"
+    assert _FakeManager.interact_calls[0][0] == "sess-team-routed-followup"
+    assert _FakeManager.interact_calls[0][1].startswith(
+        "[Team routing directive]\nTopology: parallel"
+    )
+    assert len(chunks) == 2
+
+
+@pytest.mark.anyio
 async def test_process_team_message_stream_retries_followup_while_native_starts(monkeypatch):
     class _FakeManager(_InactiveTeamRuntimeManagerMixin):
         interact_calls: list[tuple[str, str]] = []

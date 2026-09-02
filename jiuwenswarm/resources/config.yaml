@@ -1123,6 +1123,64 @@ mcp:
   #       Authorization: Bearer ${MCP_TOKEN}
   #     timeout_s: 30
 
+# Query-adaptive collaboration routing inside Team mode. The macro router still
+# decides agent vs. team; this router only selects topology and required roles
+# for each query after Team mode is active.
+team_routing:
+  enabled: false
+  confidence_threshold: 0.45
+  role_threshold: 0.16
+  max_roles: 4
+  default_topology: sequential
+  default_role: generalist
+  cost_weight: 0.08
+  topologies:
+    - id: direct
+      description: Leader-led execution with minimal delegation
+      dispatch_mode: autonomous
+      routing_markers: [simple, quick, direct answer, brief]
+      complexity: 1
+      cost_tier: 1
+    - id: sequential
+      description: Dependency-ordered chain with explicit hand-offs
+      dispatch_mode: scheduled
+      routing_markers: [step by step, then, pipeline, documents below]
+      complexity: 2
+      cost_tier: 2
+    - id: parallel
+      description: Independent subtasks executed concurrently
+      dispatch_mode: autonomous
+      routing_markers: [in parallel, independent, multiple, several, across]
+      complexity: 3
+      cost_tier: 3
+    - id: review
+      description: Scheduled producer-reviewer workflow with rework
+      dispatch_mode: scheduled
+      routing_markers: [review, verify, audit, validate, correctness]
+      complexity: 3
+      cost_tier: 3
+      enable_verification: true
+      max_review_rounds: 2
+  roles:
+    - id: generalist
+      description: General problem solving and synthesis
+      capabilities: [answer, write, summarize, synthesize]
+    - id: researcher
+      description: Find and extract evidence from sources and documents
+      capabilities: [research, source, document, evidence, web]
+      routing_markers: [documents below, sources, research, find]
+    - id: analyst
+      description: Reason, compare, calculate, and connect evidence
+      capabilities: [analyze, reason, compare, calculate, question]
+      routing_markers: [compare, analyze, why, question]
+    - id: implementer
+      description: Implement software or produce a concrete artifact
+      capabilities: [code, implement, debug, build, software]
+      routing_markers: [implement, code, debug, fix, build]
+    - id: reviewer
+      description: Verify correctness, test outputs, and identify defects
+      capabilities: [review, verify, test, audit, correctness]
+      routing_markers: [review, verify, test, audit, validate]
 
 modes:
   # 一级模式 agent / code / team
