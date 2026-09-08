@@ -146,6 +146,7 @@ from jiuwenswarm.runtime.request import (
     apply_resolved_mode_to_request as _apply_resolved_mode_to_request,
     prepare_chat_turn,
     resolve_agent_request_mode,
+    resolve_auto_macro_lane_for_request as _resolve_auto_macro_lane_for_request,  # noqa: F401
     resolve_request_project_dir,
     resolve_request_runtime_mode,
     sync_chat_request_metadata as _sync_chat_request_metadata,
