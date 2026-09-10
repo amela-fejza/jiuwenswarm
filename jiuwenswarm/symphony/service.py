@@ -82,8 +82,13 @@ class SwarmSymphonyService:
         *,
         force: bool = False,
         progress: ProgressCallback | None = None,
+        llm_config: LLMConfig | None = None,
     ) -> dict[str, Any]:
-        return await self._build_graph(force=force, progress=progress)
+        return await self._build_graph(
+            force=force,
+            progress=progress,
+            llm_config=llm_config,
+        )
 
     async def start_refresh_graph(
         self,
@@ -221,6 +226,7 @@ class SwarmSymphonyService:
         candidate_skill_ids: list[str] | None = None,
         *,
         progress: ProgressCallback | None = None,
+        llm_config: LLMConfig | None = None,
     ) -> dict[str, Any]:
         query = str(query or "").strip()
         if not query:
@@ -248,7 +254,10 @@ class SwarmSymphonyService:
                 "graph_status": status,
             }
         if _graph_needs_build(status):
-            graph_build = await self.refresh_graph(progress=progress)
+            refresh_kwargs: dict[str, Any] = {"progress": progress}
+            if llm_config is not None:
+                refresh_kwargs["llm_config"] = llm_config
+            graph_build = await self.refresh_graph(**refresh_kwargs)
             if not graph_build.get("success"):
                 failure = {
                     "success": False,
@@ -272,7 +281,12 @@ class SwarmSymphonyService:
         else:
             graph_build = None
         try:
-            public_payload = await self._runtime_for(config).orchestration.plan(
+            runtime = (
+                self._runtime_for(config, llm_config=llm_config)
+                if llm_config is not None
+                else self._runtime_for(config)
+            )
+            public_payload = await runtime.orchestration.plan(
                 query,
                 candidate_ids=candidate_ids,
                 language=language,
@@ -326,6 +340,7 @@ class SwarmSymphonyService:
         progress: ProgressCallback | None,
         prestarted: bool = False,
         config: SymphonyConfig | None = None,
+        llm_config: LLMConfig | None = None,
     ) -> dict[str, Any]:
         config = config or load_symphony_config()
         skills_root = config.paths.skills_root
@@ -367,7 +382,7 @@ class SwarmSymphonyService:
                 )
             try:
                 try:
-                    llm_config = LLMConfig.from_default_model()
+                    llm_config = llm_config or LLMConfig.from_default_model()
                     model_name = str(getattr(llm_config, "model", "") or "")
                     build_logger.record(
                         "model.probe.start",
@@ -451,8 +466,13 @@ class SwarmSymphonyService:
             finally:
                 await self._clear_active_build_task(current_task)
 
-    def _runtime_for(self, config) -> SymphonyRuntime:
-        llm_config = LLMConfig.from_default_model()
+    def _runtime_for(
+        self,
+        config,
+        *,
+        llm_config: LLMConfig | None = None,
+    ) -> SymphonyRuntime:
+        llm_config = llm_config or LLMConfig.from_default_model()
         llm_signature = llm_config_signature(llm_config)
         key = (
             str(config.paths.graph_dir),

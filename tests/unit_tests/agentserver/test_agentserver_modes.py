@@ -45,6 +45,131 @@ def fake_encode_agent_chunk_for_wire(chunk, response_id, sequence):
     }
 
 
+def test_external_memory_unload_commits_serialized_session_messages(monkeypatch):
+    events = []
+
+    class FakeMessage:
+        def model_dump(self, *, mode):
+            assert mode == "json"
+            return {"role": "assistant", "content": "done"}
+
+    class FakeToDictMessage:
+        def to_dict(self):
+            return {"role": "assistant", "content": "archived"}
+
+    class FakeContext:
+        def get_messages(self):
+            return [
+                {"role": "user", "content": "hello"},
+                FakeMessage(),
+                FakeToDictMessage(),
+            ]
+
+    class FakeContextEngine:
+        def __init__(self):
+            self.session_id = None
+
+        def get_context(self, *, session_id):
+            self.session_id = session_id
+            return FakeContext()
+
+    class FakeProvider:
+        name = "openviking"
+
+        def __init__(self):
+            self.messages = None
+            self.call_count = 0
+
+        async def on_session_end(self, messages):
+            self.call_count += 1
+            self.messages = messages
+            events.append("commit")
+
+    class FakeInstance:
+        def __init__(self, context_engine):
+            self.react_agent = type("ReactAgent", (), {"context_engine": context_engine})()
+            self.unregistered = []
+
+        async def unregister_rail(self, rail):
+            self.unregistered.append(rail)
+
+    context_engine = FakeContextEngine()
+    provider = FakeProvider()
+    rail = type("Rail", (), {"_provider": provider})()
+    instance = FakeInstance(context_engine)
+    adapter = object.__new__(interface_deep_module.JiuWenSwarmDeepAdapter)
+    adapter._external_memory_rail = rail
+    adapter._external_memory_rail_registered = True
+    adapter._external_memory_session_finalized = False
+    adapter._parent_session_id = "session-2472"
+    adapter._instance = instance
+    adapter._eternal_conversation_enabled = False
+
+    from jiuwenswarm.agents.harness.common.memory import external_memory_config
+
+    monkeypatch.setattr(interface_deep_module, "get_config", lambda: {})
+    monkeypatch.setattr(external_memory_config, "is_external_memory_enabled", lambda _config: False)
+
+    async def exercise_unload():
+        async def finish_sync():
+            events.append("sync-start")
+            await asyncio.sleep(0)
+            events.append("sync-end")
+
+        rail._sync_task = asyncio.create_task(finish_sync())
+        await asyncio.gather(
+            adapter._finalize_external_memory_session(),
+            adapter._finalize_external_memory_session(),
+        )
+        await adapter._handle_external_memory_rail_by_config()
+
+    asyncio.run(exercise_unload())
+
+    assert context_engine.session_id == "session-2472"
+    assert events == ["sync-start", "sync-end", "commit"]
+    assert provider.call_count == 1
+    assert provider.messages == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "done"},
+        {"role": "assistant", "content": "archived"},
+    ]
+    assert instance.unregistered == [rail]
+    assert adapter._external_memory_rail is None
+    assert adapter._external_memory_rail_registered is False
+
+
+def test_external_memory_finalize_retries_after_commit_failure():
+    class FlakyProvider:
+        name = "openviking"
+
+        def __init__(self):
+            self.call_count = 0
+
+        async def on_session_end(self, _messages):
+            self.call_count += 1
+            if self.call_count == 1:
+                raise RuntimeError("temporary commit failure")
+
+    provider = FlakyProvider()
+    adapter = object.__new__(interface_deep_module.JiuWenSwarmDeepAdapter)
+    adapter._external_memory_rail = type(
+        "Rail", (), {"_provider": provider, "_sync_task": None}
+    )()
+    adapter._external_memory_session_finalized = False
+    adapter._parent_session_id = "session-retry"
+    adapter._instance = None
+
+    async def exercise_retry():
+        await adapter._finalize_external_memory_session()
+        assert adapter._external_memory_session_finalized is False
+        await adapter._finalize_external_memory_session()
+
+    asyncio.run(exercise_retry())
+
+    assert provider.call_count == 2
+    assert adapter._external_memory_session_finalized is True
+
+
 def _is_regular_skill_evolution_rail(rail):
     return isinstance(
         rail,
@@ -886,6 +1011,63 @@ def test_process_message_stream_routes_team_plan_confirm_interrupt_as_team_follo
     assert chunks[0].payload == {"event_type": "chat.done"}
     assert chunks[0].is_complete is True
     assert chunks[-1].is_complete is True
+
+
+def test_deliver_control_input_uses_existing_adapter_without_opening_work_turn(monkeypatch):
+    from jiuwenswarm.server.runtime.agent_adapter import interface as interface_module
+
+    class FakeSessionManager:
+        @staticmethod
+        def get_session_id(session_id=None):
+            return session_id or "default"
+
+    class FakeAdapter:
+        seen_inputs = None
+
+        @staticmethod
+        async def process_message_stream_impl(_request, inputs):
+            FakeAdapter.seen_inputs = inputs
+            yield AgentResponseChunk(
+                request_id="answer",
+                channel_id="web",
+                payload={"event_type": "runtime.accepted"},
+                is_complete=True,
+            )
+
+    monkeypatch.setattr(interface_module, "SessionManager", FakeSessionManager)
+    monkeypatch.setattr(
+        interface_module.JiuWenSwarm,
+        "_ensure_adapter",
+        lambda self, mode="agent": FakeAdapter(),
+    )
+    swarm = interface_module.JiuWenSwarm()
+    monkeypatch.setattr(swarm, "_build_inputs", lambda _request: ({"query": "answer"}, "disabled", None))
+
+    async def reconcile(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(swarm, "reconcile_session_mcp", reconcile)
+    request = AgentRequest(
+        request_id="answer",
+        channel_id="web",
+        session_id="session",
+        req_method=ReqMethod.CHAT_SEND,
+        params={
+            "query": "",
+            "mode": "agent",
+            "request_id": "ask-call",
+            "answers": [{"selected_options": ["A"]}],
+            "source": "ask_user_interrupt",
+        },
+        is_stream=True,
+    )
+
+    async def collect_chunks():
+        return [chunk async for chunk in swarm.deliver_control_input(request)]
+
+    chunks = asyncio.run(collect_chunks())
+    assert FakeAdapter.seen_inputs == {"query": "answer"}
+    assert chunks[0].payload == {"event_type": "runtime.accepted"}
 
 
 def test_process_message_stream_routes_web_evolution_interrupt_without_user_history(monkeypatch):

@@ -11,6 +11,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from jiuwenswarm import runtime as runtime_package
+from jiuwenswarm.agents.harness.code.rails.heartbeat.execution import (
+    SessionRunAdmission,
+)
 from jiuwenswarm.common.schema.agent import AgentRequest
 from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk
 from jiuwenswarm.common.schema.message import ReqMethod
@@ -18,6 +21,10 @@ from jiuwenswarm.runtime import AgentRuntime, RuntimeStateError
 from jiuwenswarm.runtime import service as runtime_service_module
 from jiuwenswarm.runtime.events import RuntimeEvent
 from jiuwenswarm.runtime.plan import PlanStateResult
+
+
+async def _collect_events(stream) -> list[RuntimeEvent]:
+    return [event async for event in stream]
 
 
 class FakeAgentManager:
@@ -93,6 +100,9 @@ class FakeAgent:
             metadata={"route": "unary"},
         )
 
+    async def execute_message(self, request: AgentRequest) -> AgentResponse:
+        return await self.process_message(request)
+
     async def process_message_stream(self, request: AgentRequest):
         yield AgentResponseChunk(
             request_id=request.request_id,
@@ -107,6 +117,56 @@ class FakeAgent:
             is_complete=True,
             metadata={"route": "stream"},
         )
+
+    async def deliver_control_input(self, request: AgentRequest):
+        yield AgentResponseChunk(
+            request_id=request.request_id,
+            channel_id=request.channel_id,
+            payload={"event_type": "runtime.accepted"},
+            is_complete=False,
+        )
+        yield AgentResponseChunk(
+            request_id=request.request_id,
+            channel_id=request.channel_id,
+            payload=None,
+            is_complete=True,
+        )
+
+
+class AskUserAgent(FakeAgent):
+    async def process_message(self, request: AgentRequest) -> AgentResponse:
+        return AgentResponse(
+            request_id=request.request_id,
+            channel_id=request.channel_id,
+            payload={
+                "event_type": "chat.ask_user_question",
+                "request_id": "call_ask_user",
+            },
+        )
+
+    async def process_message_stream(self, request: AgentRequest):
+        params = request.params if isinstance(request.params, dict) else {}
+        if params.get("answers"):
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload={"event_type": "chat.final", "content": "answered"},
+                is_complete=True,
+            )
+            return
+        yield AgentResponseChunk(
+            request_id=request.request_id,
+            channel_id=request.channel_id,
+            payload={
+                "event_type": "chat.ask_user_question",
+                "request_id": "call_ask_user",
+            },
+            is_complete=True,
+        )
+
+    async def deliver_control_input(self, request: AgentRequest):
+        async for chunk in self.process_message_stream(request):
+            yield chunk
 
 
 class FakeAdmissionController:
@@ -242,6 +302,79 @@ async def test_create_or_resume_session_uses_runtime_manager() -> None:
         ("process_cli", None),
         ("process_cli", "cli-session-1"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "owned"),
+    [("agent.work.normal", True), ("agent.work.plan", False)],
+)
+async def test_session_switch_commit_registers_single_agent_runtime(
+    mode: str,
+    owned: bool,
+) -> None:
+    runtime = AgentRuntime(
+        agent_manager=FakeAgentManager(),
+        initializer=AsyncMock(),
+    )
+    await runtime.start()
+    prepared = MagicMock()
+    prepared.state = runtime_package.SessionProvisionState.COMMITTED
+    runtime._session_provisioner.commit_session_provision = AsyncMock(
+        return_value=runtime_package.SessionSwitchResult(
+            channel_id="web",
+            session_id="switched-session",
+            mode=mode,
+        )
+    )
+
+    await runtime.commit_session_provision(
+        prepared,
+        timing=runtime_package.SessionProvisionCommitTiming.BEFORE_RESULT_DELIVERY,
+    )
+
+    assert runtime.owns_session("switched-session") is owned
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "owned"),
+    [("agent.work.normal", True), ("agent.work.plan", False)],
+)
+async def test_session_create_commit_registers_single_agent_runtime(
+    mode: str,
+    owned: bool,
+) -> None:
+    runtime = AgentRuntime(
+        agent_manager=FakeAgentManager(),
+        initializer=AsyncMock(),
+    )
+    await runtime.start()
+    prepared = MagicMock()
+    prepared.state = runtime_package.SessionProvisionState.COMMITTED
+    runtime._session_provisioner.commit_session_provision = AsyncMock(
+        return_value=runtime_package.SessionCreateResult(
+            channel_id="web",
+            session_id="created-session",
+            project_id="default_work",
+            project_dir="",
+            work_mode="work",
+            persist_session=False,
+            prewarm_hit=False,
+            prewarm_status="warming",
+            created=True,
+            canonical_mode=mode,
+        )
+    )
+
+    await runtime.commit_session_provision(
+        prepared,
+        timing=runtime_package.SessionProvisionCommitTiming.AFTER_RESULT_DELIVERY,
+    )
+
+    assert runtime.owns_session("created-session") is owned
+    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -876,6 +1009,78 @@ async def test_answer_interaction_forwards_runtime_execution_options() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pending_interaction_blocks_heartbeat_until_matching_answer() -> None:
+    admission = SessionRunAdmission()
+
+    class InteractionManager(FakeAgentManager):
+        def get_agent_for_session_nowait(
+            self, channel_id: str, session_id: str
+        ) -> object:
+            return self.agent
+
+    manager = InteractionManager()
+    manager.agent = AskUserAgent()
+    runtime = AgentRuntime(
+        agent_manager=manager,
+        initializer=AsyncMock(),
+        plan_controller=FakePlanController(),
+        admission_controller=admission,
+    )
+    session_id = "ask-user-session"
+    request = AgentRequest(
+        request_id="ask-user-request",
+        channel_id="web",
+        session_id=session_id,
+        req_method=ReqMethod.CHAT_SEND,
+        params={"query": "ask", "mode": "agent", "work_mode": "work"},
+        is_stream=True,
+    )
+
+    events = [event async for event in runtime.stream(request, trigger_hook=False)]
+
+    assert [event.event_type for event in events] == ["chat.ask_user_question"]
+    assert admission.has_pending_interaction(session_id) is True
+    assert await admission.try_begin_heartbeat(session_id, "heartbeat-1") is False
+
+    answer = AgentRequest(
+        request_id="answer-request",
+        channel_id="web",
+        session_id=session_id,
+        req_method=ReqMethod.CHAT_SEND,
+        params={
+            "query": "",
+            "request_id": "call_ask_user",
+            "answers": [{"question": "choose", "selected_options": ["A"]}],
+            "source": "ask_user_interrupt",
+            "mode": "agent",
+            "work_mode": "work",
+        },
+        is_stream=True,
+    )
+    answer_events = [
+        event async for event in runtime.stream(answer, trigger_hook=False)
+    ]
+
+    assert [event.event_type for event in answer_events] == ["chat.final"]
+    assert admission.has_pending_interaction(session_id) is False
+    assert await admission.try_begin_heartbeat(session_id, "heartbeat-2") is True
+    await admission.end_heartbeat(session_id, "heartbeat-2")
+
+
+@pytest.mark.asyncio
+async def test_stale_answer_does_not_clear_current_pending_interaction() -> None:
+    admission = SessionRunAdmission()
+    await admission.mark_interaction_pending("session-1", "current-question")
+
+    await admission.begin_user("session-1")
+    await admission.clear_interaction_pending("session-1", "stale-question")
+    await admission.end_user("session-1")
+
+    assert admission.has_pending_interaction("session-1") is True
+    assert await admission.try_begin_heartbeat("session-1", "heartbeat-1") is False
+
+
+@pytest.mark.asyncio
 async def test_interrupt_resume_does_not_wait_for_existing_user_admission() -> None:
     admission = FakeAdmissionController(user_active=True)
     manager = FakeAgentManager()
@@ -978,12 +1183,10 @@ async def test_interrupt_resume_stream_does_not_wait_for_existing_user_admission
         plan_controller=FakePlanController(),
         admission_controller=admission,
     )
-    session_id = "ask-user-stream-session"
-
     request = AgentRequest(
         request_id="answer-stream-dispatch",
         channel_id="tui",
-        session_id=session_id,
+        session_id="ask-user-stream-session",
         req_method=ReqMethod.CHAT_SEND,
         is_stream=True,
         params={
@@ -999,6 +1202,125 @@ async def test_interrupt_resume_stream_does_not_wait_for_existing_user_admission
     events = [event async for event in runtime.stream(request, trigger_hook=False)]
     assert [event.event_type for event in events] == ["chat.delta", "chat.final"]
     assert admission.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_method", "request_params", "expected_work_kind"),
+    [
+        (
+            ReqMethod.CHAT_SEND,
+            {"query": "choose", "mode": "agent", "work_mode": "work"},
+            "chat_stream",
+        ),
+        (
+            ReqMethod.COMMAND_GOAL,
+            {
+                "action": "set",
+                "objective": "finish the task",
+                "mode": "agent",
+                "work_mode": "work",
+            },
+            "goal_stream",
+        ),
+    ],
+)
+async def test_interrupt_answer_resumes_session_execution_after_stream_ends(
+    request_method: ReqMethod,
+    request_params: dict[str, object],
+    expected_work_kind: str,
+) -> None:
+    class InteractionAgent(FakeAgent):
+        async def process_message_stream(self, request: AgentRequest):
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload={
+                    "event_type": "chat.ask_user_question",
+                    "request_id": "call_ask_user",
+                    "source": "ask_user_interrupt",
+                    "questions": [],
+                },
+            )
+
+        async def deliver_control_input(self, request: AgentRequest):
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload={"event_type": "chat.final", "content": "continued"},
+                is_complete=True,
+            )
+
+    class InteractionManager(FakeAgentManager):
+        def get_agent_for_session_nowait(
+            self, channel_id: str, session_id: str
+        ) -> object:
+            return self.agent
+
+    manager = InteractionManager()
+    manager.agent = InteractionAgent()
+    runtime = AgentRuntime(
+        agent_manager=manager,
+        initializer=AsyncMock(),
+        plan_controller=FakePlanController(),
+    )
+    runtime._trigger_before_chat_request_hook = AsyncMock()
+    session_id = "ask-user-stream-session"
+    original = AgentRequest(
+        request_id="original",
+        channel_id="web",
+        session_id=session_id,
+        req_method=request_method,
+        is_stream=True,
+        params=request_params,
+    )
+    original_events = await _collect_events(runtime.stream(original, trigger_hook=False))
+    assert [event.event_type for event in original_events] == [
+        "chat.ask_user_question"
+    ]
+    waiting_snapshot = runtime.session_coordinator.snapshot_session(session_id)
+    assert waiting_snapshot is not None
+    parent = next(
+        item
+        for item in waiting_snapshot.executions
+        if item.work_kind.value == expected_work_kind
+    )
+    assert parent.state.value == "waiting_for_control"
+
+    answer = AgentRequest(
+        request_id="answer-dispatch",
+        channel_id="web",
+        session_id=session_id,
+        req_method=ReqMethod.CHAT_SEND,
+        is_stream=True,
+        params={
+            "query": "",
+            "request_id": "call_ask_user",
+            "answers": [{"question": "选择方案", "selected_options": ["A"]}],
+            "source": "ask_user_interrupt",
+            "mode": "agent",
+            "work_mode": "work",
+        },
+    )
+    control_events = await asyncio.wait_for(
+        _collect_events(runtime.stream(answer, trigger_hook=False)),
+        timeout=0.2,
+    )
+    assert [event.event_type for event in control_events] == ["chat.final"]
+    assert control_events[0].payload["content"] == "continued"
+    snapshot = runtime.session_coordinator.snapshot_session(session_id)
+    assert snapshot is not None
+    control = next(
+        item
+        for item in snapshot.executions
+        if item.work_kind.value == "control_input"
+    )
+    assert control.parent_execution_id == parent.execution_id
+    completed_parent = next(
+        item for item in snapshot.executions if item.execution_id == parent.execution_id
+    )
+    assert completed_parent.state.value == "succeeded"
+    assert control.state.value == "succeeded"
 
 
 @pytest.mark.asyncio

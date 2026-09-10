@@ -4,6 +4,7 @@
     "confirm": "确认",
     "cancel": "取消",
     "close": "关闭",
+    "clear": "清空",
     "refresh": "刷新",
     "refreshing": "刷新中...",
     "loading": "加载中...",
@@ -247,6 +248,8 @@
       "video": "视频理解",
       "videoDescription": "启用后可理解视频内容；关闭后保留已有模型配置。",
       "videoConfigTitle": "配置视频理解模型",
+      "videoGenConfigTitle": "配置视频生成模型",
+      "visualGenConfigTitle": "配置图像生成模型",
       "toggleCapability": "切换{{name}}能力",
       "saveAndEnable": "保存并启用",
       "savedRestartRequired": "配置已保存，重启后生效。",
@@ -268,6 +271,8 @@
       "chromePathPlaceholder": "例如 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     },
     "experimental": {
+      "taskAsr": "ASR 模型配置",
+      "taskFullDuplex": "任务对话全双工",
       "externalCliAgents": "三方 Agent",
       "externalCliAgentsDescription": "仅用于集群模式。",
       "a2ui": "A2UI 界面生成",
@@ -301,6 +306,21 @@
       "embed_api_base": { "title": "API 地址" },
       "embed_api_key": { "title": "API 密钥" },
       "embed_model": { "title": "模型名称" },
+      "asr_api_base": {
+        "title": "ASR API 地址",
+        "description": "填写 OpenAI 兼容 Base URL 或完整的 /audio/transcriptions 地址。",
+        "placeholder": "例如：https://api.example.com/v1"
+      },
+      "asr_api_key": {
+        "title": "ASR API 密钥",
+        "description": "用于通用语音转写；JoyAI 使用独立配置。",
+        "placeholder": "例如：sk-..."
+      },
+      "asr_model": {
+        "title": "ASR 模型",
+        "description": "用于通用语音转写的模型名称。",
+        "placeholder": "例如：FunAudioLLM/SenseVoiceSmall"
+      },
       "enable_free_models": {
         "title": "启用免费模型",
         "description": "开启后实时拉取可用的免费模型，注意免费模型可能有限流、限窗口大小等限制。免费模型来源于 Opencode Zen 网关（https://opencode.ai/zen），由 models.dev 目录（https://models.opencode.ai/api.json）与 Zen 实时模型列表取交集得到（判定标准：输入价格为 0）。"
@@ -330,9 +350,25 @@
       "video_api_key": { "title": "API 密钥" },
       "video_model": { "title": "模型名称" },
       "video_provider": { "title": "模型提供商" },
+      "video_gen_provider": { "title": "模型提供商" },
+      "video_gen_protocol": { "title": "协议" },
+      "video_gen_api_base": { "title": "API 地址", "placeholder": "例如 https://openrouter.ai/api/v1" },
+      "video_gen_api_key": { "title": "API 密钥", "placeholder": "例如 sk-..." },
+      "video_gen_model": { "title": "模型名称", "placeholder": "例如 bytedance/seedance-2.0-fast" },
+      "video_gen_enabled": { "title": "视频生成", "description": "启用视频生成工具（文生视频）；关闭后仍保留已保存的模型配置。" },
+      "visual_gen_provider": { "title": "模型提供商" },
+      "visual_gen_protocol": { "title": "协议" },
+      "visual_gen_api_base": { "title": "API 地址", "placeholder": "例如 https://openrouter.ai/api/v1" },
+      "visual_gen_api_key": { "title": "API 密钥", "placeholder": "例如 sk-..." },
+      "visual_gen_model": { "title": "模型名称", "placeholder": "例如 google/gemini-3.1-flash-image" },
+      "visual_gen_enabled": { "title": "图像生成", "description": "启用图像生成工具（文生图）；关闭后仍保留已保存的模型配置。" },
       "permissions_mode": { "title": "全局权限模式", "description": "为普通 Agent 与 Team 选择统一的安全护栏模式。" },
       "a2ui_enabled": { "title": "启用 A2UI", "description": "允许将支持的结果渲染成交互式界面。" },
       "trajectory_ui_enabled": { "title": "启用轨迹界面", "description": "在单 Agent 和集群模式中显示对话与轨迹切换，并启用轨迹观测数据链路。" },
+      "task_full_duplex_enabled": {
+        "title": "启用任务对话全双工入口",
+        "description": "输入框为空时显示全双工按钮；点击后共享整个屏幕并持续使用麦克风。"
+      },
       "kv_cache_affinity_enabled": {
         "title": "启用算力亲和",
         "description": "仅支持使用 Ascend vLLM 推理服务部署的模型，不支持通过第三方 API Key 接入的模型。"
@@ -462,6 +498,7 @@
       "created": "任务已创建",
       "cancelled": "任务已取消",
       "unblocked": "任务解除阻塞",
+      "paused": "任务已暂停",
       "updated": "任务状态更新"
     },
     "taskDetail": {
@@ -628,7 +665,10 @@
     "modeAuto": "自动",
     "modeAutoHarness": "自优化模式",
     "modeAutoHarnessDesc": "自动分析并优化目标仓库",
-    "recording": "正在录音...（松开按钮自动发送）",
+    "recording": "正在录音...（再次点击麦克风结束）",
+    "transcribing": "正在转写语音...",
+    "startRecording": "语音输入",
+    "stopRecording": "结束录音并转写",
     "waitingTasks": "等待任务",
     "messageQueue": "消息队列",
     "waitingTasksCount": "等待任务 ({{count}})",
@@ -652,6 +692,9 @@
     "holdToSpeak": "按住说话",
     "send": "发送 (Enter)",
     "stop": "停止",
+    "taskFullDuplexStart": "共享整个屏幕并开始全双工对话",
+    "taskFullDuplexStarting": "正在启动全双工对话",
+    "taskFullDuplexStop": "停止全双工对话和屏幕共享",
     "modelSelector": {
       "tooltip": "切换对话使用的模型",
       "configured": "已配置模型",
@@ -704,6 +747,25 @@
     "extensionManageMcps": "管理我的连接器",
     "extensionMore": "更多",
     "recentTasks": "进度",
+    "applicationTasks": {
+      "cancelling": "正在停止",
+      "cancelled": "已取消",
+      "controls": {
+        "drag": "拖动到另一项以调整顺序",
+        "next": "设为下一项",
+        "stop": "停止此任务",
+        "more": "任务操作",
+        "up": "上移",
+        "down": "下移",
+        "preempt": "停止当前任务并执行此项",
+        "close": "关闭",
+        "failed": "任务操作失败"
+      },
+      "queued": "排队中",
+      "running": "执行中",
+      "completed": "已完成",
+      "failed": "失败"
+    },
     "contextCompressionCommandRunning": "正在压缩上下文",
     "teamPause": "暂停",
     "teamPauseHint": "团队暂停后，直接发送下一条消息即可继续",
@@ -1171,7 +1233,7 @@
       "codexHint": "SDK 未安装时将自动安装；CLI 可使用内置版本、系统 PATH 或指定路径。",
       "useBuiltin": "使用内置 CLI",
       "detect": "检测",
-      "detectHint": "在系统 PATH 或指定路径中查找 CLI 并校验版本兼容性",
+      "detectHint": "未填写路径时从系统 PATH 查找；填写路径后检测指定的 CLI 可执行文件并校验版本",
       "selectFile": "选择文件",
       "selectFileTitle": "选择 {{agent}} 命令",
       "selectFileFailed": "选择文件失败",
@@ -1190,6 +1252,7 @@
       "windowsScriptPath": "当前选择的是 Windows 脚本文件。请改选真实的可执行文件，或勾选“使用内置 CLI”。",
       "missingInPath": "未在系统 PATH 中找到 {{agent}} CLI。可手动填写可执行文件路径，或勾选“使用内置 CLI”。",
       "missingPath": "路径不存在：{{path}}。请检查路径，或勾选“使用内置 CLI”。",
+      "directoryPath": "所填路径是一个目录：{{path}}。请填写 CLI 可执行文件的完整路径，或勾选“使用内置 CLI”。",
       "unavailableCli": "无法运行 {{agent}} CLI（{{reason}}）。请检查可执行文件，或勾选“使用内置 CLI”。",
       "autoSaved": "{{agents}} 依赖安装完成，已自动保存您的配置。",
       "installDialogTitle": "安装可选组件",
@@ -2393,6 +2456,8 @@
       "skillNetInstallFailedHint": "SkillNet 安装失败，请检查 skill URL 或依赖",
       "importFailed": "导入失败",
       "importFailedHint": "导入失败，请检查路径或权限",
+      "knowledgeSkillExists": "技能「{{name}}」已存在，请更换名称或先卸载后再试",
+      "knowledgeSkillExistsGeneric": "同名技能已存在，请更换名称或先卸载后再试",
       "uploadFailed": "文件上传失败，请重试",
       "uploadUnsafePath": "文件名包含不允许的字符或使用了系统保留名称，请重命名后上传",
       "uploadInvalidRequest": "上传请求无效或缺少文件，请重新选择文件后上传",
@@ -2846,6 +2911,7 @@
   },
   "speech": {
     "recognitionUnsupported": "浏览器不支持语音识别",
+    "recordingUnsupported": "浏览器不支持麦克风录音",
     "synthesisUnsupported": "浏览器不支持语音合成",
     "errors": {
       "noSpeech": "未检测到语音",
@@ -3062,10 +3128,10 @@
     }
   },
   "subagent": {
-    "title": "Subagents",
-    "compactTitle": "Subagents（{{count}}）",
+    "title": "子智能体",
+    "compactTitle": "子智能体（{{count}}）",
     "activeListTitle": "当前活跃 {{count}}",
-    "expand": "展开 Subagents",
+    "expand": "展开子智能体",
     "selectWithStatus": "选择 {{name}}，状态：{{status}}",
     "running": "运行中",
     "idle": "待机中",
@@ -3076,7 +3142,7 @@
     "activityTitle": "活动",
     "activityEmpty": "暂无活动",
     "historyLoading": "正在恢复历史…",
-    "empty": "暂无 Subagent",
+    "empty": "暂无子智能体",
     "activity": {
       "thinking": "思考",
       "toolCall": "工具调用",
@@ -3173,6 +3239,8 @@
       "content-creation": "内容创作",
       "security": "安全过滤",
       "communication": "通话沟通",
+      "Engineering": "工程开发",
+      "Design": "设计创意",
       "other": "其他"
     },
     "search": {
@@ -3393,7 +3461,7 @@
     "schedule": {
       "tab": { "interval": "按间隔", "cron": "Cron 表达式", "once": "单次" },
       "interval": { "label": "每隔", "unit": "分钟回到当前会话" },
-      "cron": { "hint": "标准 5 段格式：分 时 日 月 周（例：0 9 * * 1-5 表示工作日早上 9 点）" },
+      "cron": { "hint": "支持 5 段（分 时 日 月 周）或与普通 Cron 任务相同的 7 段格式（秒 分 时 日 月 周 年）。" },
       "once": { "hint": "选择具体日期和时间，到点后回到当前会话触发一次，之后自动标记为已完成", "dateLabel": "日期", "timeLabel": "时间" },
       "summary": {
         "interval": "每 {{minutes}} 分钟回到当前会话",
@@ -3402,7 +3470,7 @@
       }
     },
     "errors": {
-      "cronFieldCount": "心跳的 Cron 表达式需要 5 段（分 时 日 月 周）"
+      "cronFieldCount": "心跳的 Cron 表达式需要 5 段（分 时 日 月 周）或 7 段（秒 分 时 日 月 周 年）"
     },
     "drawer": {
       "fieldName": "任务名称",
@@ -3519,6 +3587,13 @@
     "layoutGraph": "流程图",
     "pauseResumeHint": "暂停/恢复",
     "stopHint": "停止",
+    "controlAlreadyCompleted": "工作流已完成",
+    "controlAlreadyStopped": "工作流已停止",
+    "controlAlreadyFailed": "工作流已失败",
+    "controlAlreadyPaused": "工作流已暂停",
+    "controlUnavailable": "工作流正在运行，控制暂不可用",
+    "controlNotFound": "未找到工作流运行",
+    "controlsDisabledHint": "团队未在运行，工作流暂不可直接操作；请在主会话发送消息以恢复或停止",
     "sessionBudget": "会话预算（团队共享，不随运行重置）",
     "runBudget": "本次运行预算（META.workflow_token_limit）",
     "sessionBudgetShort": "会话累计",
