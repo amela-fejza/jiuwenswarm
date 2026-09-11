@@ -86,6 +86,7 @@ import {
   useWorkspaceStore,
   useCronStore,
   useSubagentStore,
+  usePersonalContextStore,
 } from './stores';
 import { useChatRoute } from './multi-session/routing/useChatRoute';
 import { ConversationSidebar, type NewConversationOptions } from './multi-session/sidebar/ConversationSidebar';
@@ -312,6 +313,10 @@ function AppContent({
   const [trajectoryUiRequested, setTrajectoryUiRequested] = useState(false);
 
   const [activeNav, setActiveNav] = useState<MainNavKey>('chat');
+  const masterEnabled = usePersonalContextStore(
+    (s) => s.config.collection_enabled || s.config.agent_use_enabled,
+  );
+  const loadPersonalContextConfig = usePersonalContextStore((s) => s.loadConfig);
   const [serverConfig, setServerConfig] = useState<Record<string, unknown> | null>(null);
   const kvCacheAffinityEnabled = normalizeConfigBoolean(
     serverConfig?.kv_cache_affinity_enabled,
@@ -354,7 +359,6 @@ function AppContent({
   } = useResponsiveLayout();
 
   const [modelSetupGuideStep, setModelSetupGuideStep] = useState<ModelSetupGuideStep | null>(null);
-  const [modelSetupGuideManual, setModelSetupGuideManual] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
   const [dialogBusy, setDialogBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
@@ -408,6 +412,12 @@ function AppContent({
       setActiveNav('chat');
     }
   }, [activeNav]);
+
+  useEffect(() => {
+    if (!masterEnabled && activeNav === 'personalContext') {
+      setActiveNav('chat');
+    }
+  }, [activeNav, masterEnabled]);
 
   useEffect(() => {
     const handler = (e: Event) => {
@@ -772,10 +782,14 @@ function AppContent({
   );
   const hiddenNavItems = useMemo<MainNavKey[]>(() => {
     const base = getHiddenNavItemsForPlatform(frontendPlatform);
-    if (FEATURE_PERSONAL_CONTEXT_UI) return base;
     // feature 关闭时移除全部个人上下文入口
-    return [...base, 'personalContext', 'personalContextSettings'];
-  }, [frontendPlatform]);
+    if (!FEATURE_PERSONAL_CONTEXT_UI) {
+      return [...base, 'personalContext', 'personalContextSettings'];
+    }
+    // 总开关关闭时隐藏导航入口（设置页入口保留，供打开总开关）
+    if (!masterEnabled) return [...base, 'personalContext'];
+    return base;
+  }, [frontendPlatform, masterEnabled]);
 
   useEffect(() => {
     if (!serverConfig) {
@@ -1479,8 +1493,7 @@ function AppContent({
         modelSetupGuideEvaluatedRef.current = true;
         if (!oauthNavRestoredRef.current && (shouldPreviewModelSetupGuide() || isSetupGuideEnabled(config.setup_guide_enabled))) {
           setActiveNav('chat');
-          setModelSetupGuideManual(false);
-          setModelSetupGuideStep(0);
+          setModelSetupGuideStep(1);
         }
       }
     } catch (error) {
@@ -1595,13 +1608,6 @@ function AppContent({
       console.warn('Failed to refresh models list:', error);
     }
   }, [request, setAvailableModels]);
-
-  const handleSettingsConfigSaved = useCallback(
-    async (updatedKeys: readonly string[]) => {
-      if (updatedKeys.includes('enable_free_models')) await handleModelsRefresh();
-    },
-    [handleModelsRefresh],
-  );
 
   const detectExternalCli = useCallback(async (cliAgent: ExternalCliAgentKind, cliPath?: string) => {
     return request<{
@@ -1836,6 +1842,14 @@ function AppContent({
       })
       .catch(() => {});
   }, [isConnected]);
+
+  // 连接成功后拉取个人上下文配置，使总开关（派生态）在刷新后与后端持久化状态一致
+  useEffect(() => {
+    if (!isConnected || !FEATURE_PERSONAL_CONTEXT_UI) return;
+    void loadPersonalContextConfig().catch(() => {
+      // 静默；未配置时后端返回投影，拉取失败不影响主流程
+    });
+  }, [isConnected, loadPersonalContextConfig]);
 
   // 当会话 ID 变化或页面加载时，自动加载历史会话
   useEffect(() => {
@@ -3016,7 +3030,6 @@ function AppContent({
 
   const skipModelSetupGuide = useCallback(() => {
     setModelSetupGuideStep(null);
-    setModelSetupGuideManual(false);
 
     void request('config.set', { setup_guide_enabled: 'false' })
       .then(() => {
@@ -3030,23 +3043,8 @@ function AppContent({
       });
   }, [request]);
 
-  const quickSetupModelSetupGuide = useCallback(() => {
-    setModelSetupGuideStep(null);
-    setModelSetupGuideManual(false);
-    // 显式指定使用 huawei-cloud-maas-setup skill，避免 agent 自行上网搜索
-    void handleSendMessage(
-      '请使用 huawei-cloud-maas-setup 技能帮我配置华为云 MaaS 服务。'
-      + '严格按照其中的步骤引导我完成购买、获取 API Key 和配置写入。'
-    );
-  }, [handleSendMessage]);
-
-  const manualSetupModelSetupGuide = useCallback(() => {
-    setModelSetupGuideStep(1);
-  }, []);
-
   const acknowledgeModelSetupGuide = useCallback(() => {
     setModelSetupGuideStep(null);
-    setModelSetupGuideManual(false);
 
     void request('config.set', { setup_guide_enabled: 'false' })
       .then(() => {
@@ -3175,11 +3173,8 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
       {modelSetupGuideStep !== null ? (
         <ModelSetupGuide
           step={modelSetupGuideStep}
-          manual={modelSetupGuideManual}
           onAcknowledge={acknowledgeModelSetupGuide}
           onSkip={skipModelSetupGuide}
-          onQuickSetup={quickSetupModelSetupGuide}
-          onManualSetup={manualSetupModelSetupGuide}
         />
       ) : null}
 
@@ -3430,7 +3425,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               connectionState={connectionState}
               request={settingsRequest}
               onHasChangesChange={handleSettingsHasChangesChange}
-              onConfigSaved={handleSettingsConfigSaved}
               onDetectExternalCli={detectExternalCli}
               onSelectExternalCliPath={selectExternalCliPath}
               onTrackExternalCliDependencyInstalls={trackExternalCliDependencyInstalls}
