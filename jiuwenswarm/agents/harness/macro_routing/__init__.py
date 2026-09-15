@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Lightweight MACRO scheduler (LAS-inspired): Agent / Cluster."""
+"""Lightweight Auto scheduler (agent vs team)."""
 
 from jiuwenswarm.agents.harness.macro_routing.config import load_macro_routing_config
 from jiuwenswarm.agents.harness.macro_routing.gate import route_with_gate

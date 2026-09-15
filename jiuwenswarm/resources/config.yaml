@@ -1387,7 +1387,7 @@ mcp:
 
 
 modes:
-  # Lightweight MACRO Auto scheduler (LAS-inspired). Default UI mode is Agent;
+  # Lightweight Auto scheduler (agent vs team). Default UI mode is Agent;
   # Plan is a separate toggle on forced Agent/Cluster. Auto is opt-in and maps
   # to agent / team.
   macro_routing:

@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Entry point for LAS-inspired MACRO mode routing."""
+"""Entry point for the lightweight Auto scheduler (agent vs team)."""
 
 from __future__ import annotations
 

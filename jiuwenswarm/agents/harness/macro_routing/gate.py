@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Cheap LAS-style gate for MACRO mode selection (no LLM)."""
+"""Keyword gate for the lightweight Auto scheduler (agent vs team); no LLM."""
 
 from __future__ import annotations
 

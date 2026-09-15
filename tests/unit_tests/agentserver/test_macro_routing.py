@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Unit tests for lightweight MACRO scheduler (LAS-inspired)."""
+"""Unit tests for the lightweight Auto scheduler (agent vs team)."""
 
 from __future__ import annotations
 
