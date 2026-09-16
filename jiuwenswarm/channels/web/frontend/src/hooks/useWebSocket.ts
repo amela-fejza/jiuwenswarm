@@ -81,6 +81,8 @@ import {
   extractCrossSessionMessage,
   crossSessionUserMessageId,
   crossSessionAssistantMessageId,
+  generateUuidV4,
+  prefixedMessageId,
 } from '../utils';
 import {
   findOverlappingFileExecutionEvent,
@@ -118,6 +120,27 @@ import { normalizeTeamLeaderIdentity } from '../features/teamLeaderIdentity';
 import { NEW_CONVERSATION_ID } from '../multi-session/state/newConversationLifecycle';
 
 const WS_RECONNECT_EVENT = 'jiuwenclaw:ws-reconnect-request';
+
+export function applyToolUpdatePayload(
+  sessionId: string,
+  payload: Record<string, unknown>,
+): void {
+  const update = normalizeToolUpdatePayload(payload);
+  if (!update.toolCallId) return;
+  if (update.beamSearch) {
+    useChatStore.getState().updateToolProgress(sessionId, update.toolCallId, {
+      toolName: update.toolName,
+      beamSearch: update.beamSearch,
+    });
+  }
+  if (update.reviewer) {
+    useChatStore.getState().updateToolReviewer(
+      sessionId,
+      update.toolCallId,
+      update.reviewer,
+    );
+  }
+}
 
 function streamDeltaBatchKey(sessionId: string, streamId: string): string {
   return `${sessionId}\u0000${streamId}`;
@@ -933,6 +956,15 @@ function stringifyCompact(value: unknown): string {
   }
 }
 
+/** 归档相关事件的负载；事件仅用于同步刷新，按资源 ID 幂等处理，不替代请求结果。 */
+type ArchiveResourceEventPayload = {
+  session_id?: string;
+  project_id?: string;
+  work_mode?: string;
+};
+
+const ARCHIVE_EVENT_REFRESH_DEBOUNCE_MS = 300;
+
 export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   const { t } = useTranslation();
   const {
@@ -1488,7 +1520,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         const webError = error as WebError;
         const errorMsg = webError.message || t('network.sendMessageFailed');
         useChatStore.getState().addMessage(sessionId, {
-          id: `error-${Date.now()}`,
+          id: prefixedMessageId('error-'),
           role: 'system',
           content: t('network.errorPrefix', { message: errorMsg }),
           timestamp: new Date().toISOString(),
@@ -1609,7 +1641,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       const unsupportedEvolutionMode = unsupportedEvolutionModeMessage(content, currentMode ?? 'agent');
       if (unsupportedEvolutionMode) {
         useChatStore.getState().addMessage(sessionId, {
-          id: `error-${Date.now()}`,
+          id: prefixedMessageId('error-'),
           role: 'system',
           content: unsupportedEvolutionMode,
           timestamp: new Date().toISOString(),
@@ -1655,7 +1687,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       // 名字发给后端；被摘掉的项同步从 sessionStore 里移除，让"+"扩展面板的开关同步变回关闭。
       const extensionPayload = buildExtensionSendPayload(sessionId);
       useChatStore.getState().addMessage(sessionId, {
-        id: `user-${Date.now()}`,
+        id: prefixedMessageId('user-'),
         role: 'user',
         content: stripUploadDocumentBlocks(content) || content.replace(/\n*【上传文档[\s\S]*$/, '').trim() || content,
         mediaItems,
@@ -1780,7 +1812,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         const errorMsg = webError.message || t('network.sendMessageFailed');
         onErrorRef.current?.(errorMsg);
         useChatStore.getState().addMessage(sessionId, {
-          id: `error-${Date.now()}`,
+          id: prefixedMessageId('error-'),
           role: 'system',
           content: t('network.errorPrefix', { message: errorMsg }),
           timestamp: new Date().toISOString(),
@@ -1866,7 +1898,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         const errorMsg = webError.message || t('network.sendMessageFailed');
         onErrorRef.current?.(errorMsg);
         useChatStore.getState().addMessage(sessionId, {
-          id: `error-${Date.now()}`,
+          id: prefixedMessageId('error-'),
           role: 'system',
           content: t('network.errorPrefix', { message: errorMsg }),
           timestamp: new Date().toISOString(),
@@ -1951,7 +1983,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           closeActiveTeamLeaderMessages(sessionId);
         }
         useChatStore.getState().addMessage(sessionId, {
-          id: `user-${Date.now()}`,
+          id: prefixedMessageId('user-'),
           role: 'user',
           content: newInput,
           timestamp: new Date().toISOString(),
@@ -2567,6 +2599,17 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       });
     };
 
+    // 归档事件去抖句柄：同一时间窗内成串到达的事件只触发一次工作区刷新
+    let archiveRefreshTimer: number | null = null;
+    const scheduleArchiveWorkspaceRefresh = (includeCron: boolean) => {
+      if (archiveRefreshTimer !== null) window.clearTimeout(archiveRefreshTimer);
+      archiveRefreshTimer = window.setTimeout(() => {
+        archiveRefreshTimer = null;
+        void useWorkspaceStore.getState().refreshWorkspaceData();
+        if (includeCron) void useCronStore.getState().loadJobs();
+      }, ARCHIVE_EVENT_REFRESH_DEBOUNCE_MS);
+    };
+
     const unsubs = [
       webClient.on('connection.ack', ({ payload }) => {
         handleConnectionAck(payload);
@@ -2681,7 +2724,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             // 因为再也等不到后续 chat.final 收尾而永久闪烁（bug001）。paused 状态下新起的
             // 气泡直接落地为非 streaming，內容仍然展示，只是不再挂一个不会消失的光标。
             const isPaused = Boolean(useChatStore.getState().getRuntime(sessionId)?.isPaused);
-            const msgId = `team-leader-${Date.now()}`;
+            const msgId = prefixedMessageId('team-leader-');
             useChatStore.getState().addMessage(sessionId, {
               id: msgId,
               role: 'system',
@@ -2727,7 +2770,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           }
         }
         if (!currentStreamId && content) {
-          const assistantMsgId = `assistant-${Date.now()}`;
+          const assistantMsgId = prefixedMessageId('assistant-');
           const proactiveRecId = typeof payload.proactive_rec_id === 'string' ? payload.proactive_rec_id : undefined;
           const proactiveType = typeof payload.proactive_type === 'string' ? payload.proactive_type : undefined;
           useChatStore.getState().addMessage(sessionId, {
@@ -2916,7 +2959,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           const content = normalizeFinalContent(payload);
           if (content) {
             useChatStore.getState().addMessage(sessionId, {
-              id: `team-human-${memberAction}-${Date.now()}`,
+              id: `team-human-${memberAction}-${generateUuidV4()}`,
               role: 'system',
               content,
               timestamp: normalizeEventTimestampIso(payload.timestamp),
@@ -3079,14 +3122,14 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               useChatStore.getState().collapseTurnFinal(sessionId, {
                 kind: 'team',
                 content,
-                finalId: `team-leader-${Date.now()}`,
+                finalId: prefixedMessageId('team-leader-'),
                 timestampIso: iso,
               });
               return;
             }
             if (finalAction.type === 'append') {
               useChatStore.getState().addMessage(sessionId, {
-                id: `team-leader-${Date.now()}`,
+                id: prefixedMessageId('team-leader-'),
                 role: 'system',
                 content: `team.leader:${JSON.stringify({ content, timestamp: Date.parse(iso) || Date.now() })}`,
                 timestamp: iso,
@@ -3102,7 +3145,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               return;
             }
             useChatStore.getState().addMessage(sessionId, {
-              id: `team-leader-${Date.now()}`,
+              id: prefixedMessageId('team-leader-'),
               role: 'system',
               content: `team.leader:${JSON.stringify({ content, timestamp: Date.parse(iso) || Date.now() })}`,
               timestamp: iso,
@@ -3120,7 +3163,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           }
 
           useChatStore.getState().addMessage(sessionId, {
-            id: `team-leader-${Date.now()}`,
+            id: prefixedMessageId('team-leader-'),
             role: 'system',
             content: `team.leader:${JSON.stringify({ content, timestamp })}`,
             timestamp: new Date().toISOString(),
@@ -3159,7 +3202,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               useChatStore.getState().stopStreaming(sessionId);
             }
             if (shouldCollapseTurnFinal(messages, content, 'agent', finalAction)) {
-              const finalId = `msg-final-${Date.now()}`;
+              const finalId = prefixedMessageId('msg-final-');
               useChatStore.getState().collapseTurnFinal(sessionId, {
                 kind: 'agent',
                 content,
@@ -3297,7 +3340,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               ? `cron-placeholder-${cronRunId}`
               : cronRunId && !isCronPlaceholderContent
                 ? `cron-final-${cronRunId}`
-                : `msg-${Date.now()}`;
+                : prefixedMessageId('msg-');
 
           const existing = messages.find((m) => m.id === messageId);
           if (existing) {
@@ -3371,7 +3414,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               }
               return;
             }
-            const finalMsgId = `msg-final-${Date.now()}`;
+            const finalMsgId = prefixedMessageId('msg-final-');
             useChatStore.getState().addMessage(sessionId, {
               id: finalMsgId,
               role: 'assistant',
@@ -3527,7 +3570,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             });
           } else {
             useChatStore.getState().addMessage(sessionId, {
-              id: `team-leader-${Date.now()}`,
+              id: prefixedMessageId('team-leader-'),
               role: 'system',
               content: '',
               timestamp: new Date().toISOString(),
@@ -3637,12 +3680,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       webClient.on('chat.tool_update', ({ payload }) => {
         const sessionId = resolveEventSessionId(payload);
         if (!sessionId) return;
-        const update = normalizeToolUpdatePayload(payload);
-        if (!update.toolCallId || !update.beamSearch) return;
-        useChatStore.getState().updateToolProgress(sessionId, update.toolCallId, {
-          toolName: update.toolName,
-          beamSearch: update.beamSearch,
-        });
+        applyToolUpdatePayload(sessionId, payload);
       }),
       webClient.on('chat.tool_result', ({ payload }) => {
         const sessionId = resolveEventSessionId(payload);
@@ -3753,6 +3791,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             beamSearch: toolResult.beamSearch,
             ...(toolResult.mermaid ? { mermaid: toolResult.mermaid } : {}),
             ...(toolResult.timedOut ? { timedOut: true } : {}),
+            reviewer: toolResult.reviewer,
           },
           {
             updatedAt: normalizeEventTimestampIso(payload.timestamp),
@@ -3876,6 +3915,22 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (typeof payload.mode === 'string') {
           useSessionStore.getState().setMode(sessionId, normalizeAgentMode(payload.mode));
         }
+      }),
+      // 归档相关事件：集中在此分发，刷新活跃工作区数据（项目/会话/置顶）；
+      // project.deleted 还会级联删除会话与 cron，因此同步 cron 列表。
+      // 归档管理页自行订阅同名事件刷新归档列表。项目归档事件已随协议移除。
+      // 事件可能早于响应到达，去抖合并后按当前状态幂等刷新。
+      webClient.on<ArchiveResourceEventPayload>('session.archived', () => {
+        scheduleArchiveWorkspaceRefresh(false);
+      }),
+      webClient.on<ArchiveResourceEventPayload>('session.unarchived', () => {
+        scheduleArchiveWorkspaceRefresh(false);
+      }),
+      webClient.on<ArchiveResourceEventPayload>('session.deleted', () => {
+        scheduleArchiveWorkspaceRefresh(false);
+      }),
+      webClient.on<ArchiveResourceEventPayload>('project.deleted', () => {
+        scheduleArchiveWorkspaceRefresh(true);
       }),
       // 用户点"执行"后，后端在 exit_plan_mode 内部已恢复普通模式。这里同步关掉
       // 本地 Plan 开关，否则下一条消息仍会带 .plan 而重新进入 Plan。
@@ -4097,7 +4152,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         const content = pickString(payload.content, payload.message, payload.text);
         if (!content) return;
         const noticeType = pickString(payload.notice_type, payload.type) || 'notice';
-        const requestId = getPayloadRequestId(payload) || `${Date.now()}`;
+        const requestId = getPayloadRequestId(payload) || generateUuidV4();
         const messageId = `notice-${noticeType}-${requestId}`;
         const chatState = useChatStore.getState();
         const existing = chatState.getRuntime(sessionId)?.messages.find((message) => message.id === messageId);
@@ -4172,7 +4227,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         onErrorRef.current?.(errorMsg);
         useChatStore.getState().setSessionError(sessionId, errorMsg);
         useChatStore.getState().addMessage(sessionId, {
-          id: `error-${Date.now()}`,
+          id: prefixedMessageId('error-'),
           role: 'system',
           content: t('network.errorPrefix', { message: errorMsg }),
           timestamp: new Date().toISOString(),
@@ -4490,7 +4545,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         }
         clearThinkingForVisibleOutput(sessionId);
         useChatStore.getState().addMessage(sessionId, {
-          id: `team-event-${Date.now()}`,
+          id: prefixedMessageId('team-event-'),
           role: 'system',
           content: `team.event:${JSON.stringify(payload)}`,
           timestamp: new Date().toISOString(),
@@ -4504,7 +4559,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         }
         clearThinkingForVisibleOutput(sessionId);
         useChatStore.getState().addMessage(sessionId, {
-          id: `team-message-${Date.now()}`,
+          id: prefixedMessageId('team-message-'),
           role: 'system',
           content: `team.event:${JSON.stringify(payload)}`,
           timestamp: new Date().toISOString(),
@@ -4722,7 +4777,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         }
 
         useChatStore.getState().addMessage(sessionId, {
-          id: `harness-msg-${Date.now()}`,
+          id: prefixedMessageId('harness-msg-'),
           role: 'system',
           content,
           timestamp: new Date().toISOString(),
@@ -4765,7 +4820,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           });
           if (status === 'failed' && error) {
             useChatStore.getState().addMessage(sessionId, {
-              id: `harness-error-${Date.now()}`,
+              id: prefixedMessageId('harness-error-'),
               role: 'system',
               content: `Stage ${stage} failed: ${error}`,
               timestamp: new Date().toISOString(),
@@ -4855,6 +4910,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
     return () => {
       streamDeltaBatcherRef.current?.flushAll();
+      if (archiveRefreshTimer !== null) window.clearTimeout(archiveRefreshTimer);
       unsubs.forEach((fn) => fn());
     };
   }, [

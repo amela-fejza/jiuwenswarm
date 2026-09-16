@@ -36,7 +36,6 @@
     "work": "Tasks",
     "agent": "Experts",
     "experiments": "Experiments",
-    "teams": "Teams",
     "sessions": "Sessions",
     "cron": "Scheduled Tasks",
     "skills": "Skills",
@@ -66,6 +65,7 @@
       "browser": "Browser",
       "channels": "Channels",
       "personalContext": "Personal Context",
+      "archivedTasks": "Archived Tasks",
       "experimental": "Experimental"
     },
     "feedback": {
@@ -78,6 +78,39 @@
     },
     "access": {
       "readOnly": "This setting is currently read-only."
+    },
+    "archivedTasks": {
+      "description": "Manage archived conversations: restore them to the workspace or delete them permanently. Permanent deletion cannot be undone.",
+      "searchPlaceholder": "Search conversations",
+      "clearSearch": "Clear search",
+      "unassignedProject": "No project",
+      "restoreSession": "Restore conversation",
+      "deletePermanently": "Delete permanently",
+      "moreActions": "More actions",
+      "loadMore": "Load more",
+      "loadFailed": "Failed to load the archived list",
+      "emptyTitle": "Nothing archived",
+      "emptyDescription": "Archived conversations will appear here.",
+      "emptySearchTitle": "No archived conversations match your search",
+      "stopPending": "Task stop in progress",
+      "stopPendingTooltip": "This task is still being stopped. It can be restored once the stop completes.",
+      "sessionRestored": "Conversation restored",
+      "sessionDeleted": "Conversation deleted",
+      "deleteSessionTitle": "Delete conversation permanently",
+      "deleteSessionRecord": "Permanently delete the conversation \"{{sessionTitle}}\"?",
+      "deleteSessionIrreversible": "The conversation data will be permanently deleted and cannot be recovered.",
+      "deleteArchivedSessions": "Delete archived conversations",
+      "deleteArchivedSessionsTitle": "Delete archived conversations",
+      "deleteArchivedSessionsRecord": "Permanently delete all archived conversations in the project \"{{projectName}}\". This cannot be undone.",
+      "archivedSessionsDeleted": "Deleted {{count}} archived conversations",
+      "batchPartialFailure": "{{succeeded}} succeeded, {{failed}} failed.",
+      "errors": {
+        "forbidden": "This operation is not supported for this resource",
+        "notFound": "The resource no longer exists or has changed. Refresh and try again.",
+        "sessionGone": "This conversation no longer exists and cannot be restored.",
+        "requestFailed": "The operation failed. Please try again later.",
+        "sessionRestoreFailed": "Failed to restore the conversation. Refresh and try again."
+      }
     },
     "dialog": {
       "discardTitle": "Discard unsaved changes",
@@ -133,6 +166,12 @@
       "protocol": "Protocol",
       "vendor": "Model provider",
       "model": "Model",
+      "contextWindow": "Model context configuration",
+      "contextWindowPlaceholder": "For example, 256K, 1M, or 262144",
+      "contextWindowHint": "Enter a positive token count. Plain numbers and K/M units are supported case-insensitively, such as 256K, 200k, or 1310720.",
+      "contextWindow1m": "Enable 1M context window",
+      "contextWindow1mHint": "When enabled, the context window is fixed at 1M and the model context configuration cannot be edited. Confirm that the model and current provider support 1M context first.",
+      "contextWindow1mWarning": "Make sure the model and current provider support a 1M context window.",
       "vendorPlaceholder": "Select",
       "selectVendor": "Select model provider",
       "searchVendor": "Search model providers",
@@ -145,9 +184,9 @@
       "modelIdHint": "For example: glm-4.7. Model IDs vary by provider; refer to its model list or official documentation.",
       "fetchLatestModels": "Fetch latest",
       "presetModels": "Showing provider presets. Open the list to fetch the latest models",
-      "noPresetModels": "No preset models. Open the list or refresh to fetch the latest models",
-      "noPresetModelsApiKeyRequired": "No preset models. Enter an API key before fetching the latest models",
-      "noPresetModelsNoEndpoint": "This provider has no preset models or model-list endpoint",
+      "noPresetModels": "Open the list or refresh to fetch the latest models",
+      "noPresetModelsApiKeyRequired": "Enter an API key before fetching the model list",
+      "noPresetModelsNoEndpoint": "This provider does not expose a model-list endpoint",
       "fetchModelsLoading": "Fetching...",
       "fetchModelsRemote": "Fetched {{count}} models from the provider",
       "fetchModelsFailed": "Failed to fetch the model list",
@@ -155,11 +194,11 @@
       "fetchModelsInvalidResponse": "The provider model-list response is invalid",
       "fetchModelsUnrecognizedResult": "The provider returned an unrecognized model-list source or reason",
       "fetchReasons": {
-        "noEndpoint": "Using the provider preset list: this provider does not expose a model-list endpoint",
-        "apiKeyRequired": "Using the provider preset list: enter an API key to fetch the latest models",
-        "remoteFailed": "Using the provider preset list: the remote request failed or returned no models",
-        "remoteAuthFailed": "Using the provider preset list: invalid API key or auth mismatch (HTTP 401/403)",
-        "remoteRateLimited": "Using the provider preset list: rate limited (HTTP 429), retry later"
+        "noEndpoint": "This provider does not expose a model-list endpoint",
+        "apiKeyRequired": "Enter an API key to fetch the latest models",
+        "remoteFailed": "The remote request failed or returned no models",
+        "remoteAuthFailed": "Invalid API key or auth mismatch (HTTP 401/403)",
+        "remoteRateLimited": "Rate limited (HTTP 429), retry later"
       },
       "vendorGroups": {
         "token_plan": "Token Plan",
@@ -230,6 +269,7 @@
         "anthropicUnavailable": "This provider plan does not support the Anthropic protocol. Use OpenAI or select another provider",
         "reasoningUnsupported": "The reasoning option “{{value}}” is unsupported. Select another option or use the default",
         "reasoningUnavailable": "Reasoning options have not loaded. Retry before saving",
+        "contextWindowInvalid": "Enter a valid positive context window, such as 256K, 1M, or 1310720",
         "aliasConflict": "Custom name must be globally unique and cannot match another model ID",
         "modelNameConflict": "Model ID cannot match another configuration's custom name"
       },
@@ -490,7 +530,6 @@
     "noGroupMessages": "No group messages",
     "memberTasksTitle": "Tasks executed by {{member}}",
     "memberTasks": "Their tasks",
-    "noMemberTasks": "No tasks assigned to this member",
     "noProcessData": "No execution process data for this member",
     "collapseView": "Collapse view",
     "expandView": "Expand view",
@@ -827,6 +866,18 @@
     },
     "historyLoading": "Loading conversation history…",
     "historyLoadMore": "Load more history",
+    "continuedFromChat": "Continued from chat",
+    "openSourceChat": "Open source chat",
+    "sideConversation": {
+      "title": "Side chat",
+      "from": "From {{title}}",
+      "empty": "Ask a question without leaving the main chat",
+      "placeholder": "Message side chat",
+      "send": "Send message",
+      "working": "Working…",
+      "sendFailed": "Message could not be sent. Try again.",
+      "close": "Close side chat"
+    },
     "config": {
       "mode": {
         "cluster": "Cluster",
@@ -836,6 +887,8 @@
       "permission": {
         "default": "Default",
         "defaultDesc": "Always ask when editing external files or accessing the internet",
+        "automatic": "Smart Approval",
+        "automaticDesc": "Reviews tool requests against your task and permissions, asking you when needed",
         "fullAccess": "Full Access",
         "fullAccessDesc": "Unrestricted access to the internet and any files on your computer",
         "fullAccessWarning": {
@@ -941,6 +994,7 @@
     "toggleLabel": "Pursue Goal",
     "toolbarUnavailable": "A goal is already in progress. Finish or clear it first.",
     "toolbarUnavailablePlan": "Plan mode is in progress, so Goal isn't available",
+    "overwriteConfirm": "The current goal \"{{currentObjective}}\" is unfinished. Replace it with \"{{requestedObjective}}\"?",
     "closeTag": "Cancel goal",
     "badge": "Goal",
     "status": {
@@ -1337,7 +1391,7 @@
       "viaChatPrompt": "Let's set up a scheduled task together. First, explain how scheduled tasks work in WorkSwarm. Then ask me what I'd like to schedule and when it should run."
     },
     "stats": {
-      "total": "Total tasks ({{count}})"
+      "total": "Total tasks {{count}}"
     },
     "tabs": {
       "list": "Tasks",
@@ -1972,6 +2026,7 @@
       "install": "Install",
       "installing": "Installing...",
       "uninstall": "Uninstall",
+      "uninstalling": "Uninstalling...",
       "importLocal": "Import Local Skill",
       "sourceManager": "Source Manager",
       "create": "Create",
@@ -2596,6 +2651,7 @@
       "installed": "Installed",
       "loadError": "Unable to load the Expert list. Try again.",
       "detailError": "Unable to load Expert details. Try again.",
+      "hubAssetChanged": "This expert has changed or been removed on Hub. The catalog is refreshing; go back and select it again.",
       "actionError": "The action could not be completed. Try again in a moment.",
       "duplicateName": "An Expert with this name already exists. Choose a different name and try again.",
       "agentUnavailable": "This Expert is no longer available. Refresh the list and try again.",
@@ -2746,7 +2802,7 @@
         "createFirst": "Create manually",
         "createByChat": "Create via chat",
         "createByUpload": "Create from file",
-        "createViaChatPrompt": "Help me create an XXX Expert or Expert Team, skilled at XXXXX. My experience is: [please add your industry background and relevant experience]",
+        "createViaChatPrompt": "Help me create an XXX Expert Team, skilled at XXXXX. My experience is: [please add your industry background and relevant experience]",
         "install": "Install",
         "installing": "Installing…",
         "use": "Use",
@@ -2816,7 +2872,7 @@
         "uploadKindLabel": "Category",
         "uploadGroupTab": "Expert Team",
         "uploadAgentTab": "Expert",
-        "uploadHint": "Supports .zip, .tar and .tar.gz files; once extracted, the folder must include manifest.json, an agents directory and README.md, and the .json file must declare package_type.",
+        "uploadHint": "Supports uploading .zip and .tar Expert Team packages. The extracted package root must contain manifest.json, declare package_type: \"agent_group\", and configure the Expert Team name, Leader, and expert members. The package must include the member definitions, personas, and other files referenced by the configuration; README.md documentation is recommended.",
         "uploadInvalidType": "Only .zip, .tar and .tar.gz Expert Team packages are supported",
         "errors": {
           "nameRequired": "Enter an Expert Team name",
@@ -2842,6 +2898,8 @@
     "copied": "Copied",
     "stopReading": "Stop reading",
     "readMessage": "Read message",
+    "forkFromMessage": "Create a conversation branch from this message",
+    "forkFromMessageFailed": "Failed to create a conversation branch. Try again.",
     "fileExpired": "Expired",
     "agentProcessing": "Agent Processing",
     "thinking": "Thinking...",
@@ -2955,6 +3013,47 @@
         "completed": "Discovery completed",
         "failed": "Discovery failed",
         "resultWords": "{{count}} words returned"
+      }
+    },
+    "autoReviewer": {
+      "title": "Permission review",
+      "status": {
+        "approved": "Automatically allowed",
+        "userApproved": "User allowed",
+        "userRejected": "User rejected",
+        "manual": "Manual review required",
+        "denied": "Denied",
+        "blocked": "Blocked",
+        "hostRevalidationFailed": "Host validation failed",
+        "inProgress": "Reviewing",
+        "timedOut": "Review timed out",
+        "fallback": "Manual fallback",
+        "aborted": "Review stopped"
+      },
+      "details": {
+        "source": "Decision source",
+        "sourceValues": {
+          "automatic": "Smart Approval",
+          "manual": "Manual approval",
+          "system": "System permission check"
+        },
+        "risk": "Risk",
+        "riskValues": {
+          "critical": "Critical",
+          "high": "High",
+          "medium": "Medium",
+          "low": "Low",
+          "unknown": "Unknown"
+        },
+        "reason": "Reason",
+        "reasonValues": {
+          "approved": "Permission review allowed this operation.",
+          "denied": "Permission review denied this operation.",
+          "manual": "Available information is insufficient for Smart Approval; manual judgment is required.",
+          "inProgress": "Permission review is in progress."
+        },
+        "hint": "Manual review guidance",
+        "manualGuidanceFallback": "Review the tool parameters, target, and risks before deciding."
       }
     },
     "teamActivity": {
@@ -3239,12 +3338,15 @@
       "pinFailed": "Pin action failed",
       "rename": "Rename",
       "renamePlaceholder": "Enter a new name",
+      "archiveConversation": "Archive",
+      "conversationArchived": "Task session archived",
+      "archiveView": "View",
+      "archiveUndo": "Undo",
       "deleteProject": "Delete project",
       "deleteProjectDescription": "Permanently delete “<name>{{projectName}}</name>” and all its conversations and cron jobs, including active conversations. Running tasks will stop. The working directory will be kept. This cannot be undone.",
       "archiveSessions": "Archive all conversations",
-      "deleteArchivedSessions": "Delete archived conversations",
       "archiveSessionsDescription": "Archive all ordinary conversations in “<name>{{projectName}}</name>”. Running conversations will remain active and report a failure. Cron jobs stay unchanged.",
-      "deleteArchivedSessionsDescription": "Permanently delete all archived conversations in “<name>{{projectName}}</name>”. This cannot be undone.",
+      "sessionsArchived": "Archived {{count}} conversations",
       "batchPartialFailure": "{{succeeded}} succeeded, {{failed}} failed. Failed items can be retried.",
       "defaultProjectName": "Default Project",
       "absolutePathError": "Enter an absolute path, for example /Users/name/work/project",
@@ -3252,7 +3354,11 @@
         "pathExists": "This project path already exists. Choose another directory or start a new conversation from the existing project.",
         "nameExists": "This project name already exists. Please choose another name.",
         "pathMissing": "Project directory does not exist. Choose an existing directory.",
-        "projectUnavailable": "Project unavailable. Refresh and retry."
+        "projectUnavailable": "Project unavailable. Refresh and retry.",
+        "archiveSessionBusy": "The session is running. Stop it before archiving.",
+        "archiveForbidden": "This task does not support archiving.",
+        "archiveNotFound": "The resource no longer exists or has changed. Refresh and try again.",
+        "archiveFailed": "The archive operation failed. Please try again later."
       },
       "cancel": "Cancel",
       "confirm": "Confirm"
@@ -3285,7 +3391,6 @@
     "closed": "Closed",
     "failed": "Error",
     "cancelled": "Cancelled",
-    "tasksEmpty": "No tasks",
     "activityTitle": "Activity",
     "activityEmpty": "No activity yet",
     "historyLoading": "Restoring history…",
@@ -3344,6 +3449,10 @@
     "allowOnce": "Allow once",
     "allowAlways": "Always allow",
     "skip": "Skip",
+    "toolPayload": {
+      "title": "Tool payload (redacted)",
+      "notice": "This display copy is redacted and may be truncated for safety or size limits."
+    },
     "tip": {
       "allowOnce": "Allow this action only this time",
       "allowAlways": "Remember this rule and auto-allow from now on",
@@ -3456,7 +3565,7 @@
       "breadcrumbPlugin": "Plugin details",
       "breadcrumbMcp": "Connector details",
       "mcpDisconnectedBanner": "This plugin's connector isn't connected, so it can't be used normally",
-      "mcpDisconnectedBannerSelf": "This connector isn't connected, so it can't be used normally",
+      "mcpDisconnectedBannerSelf": "Not connected yet. Connect to start using it",
       "connectMcp": "Connect",
       "sections": {
         "basicInfo": "Basic info",
