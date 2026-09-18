@@ -3095,6 +3095,7 @@ export class CliPiAppState {
           ...tool,
           status: orphan.tool.status,
           result: orphan.tool.result,
+          renderedResult: orphan.tool.renderedResult,
           summary: orphan.tool.summary,
           isError: orphan.tool.isError,
         }

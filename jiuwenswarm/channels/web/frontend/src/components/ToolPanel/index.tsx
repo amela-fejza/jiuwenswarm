@@ -35,10 +35,13 @@ import { CodeReviewPanel } from '../../features/code-mode/CodeReviewPanel';
 import type { CodeReviewTarget } from '../../features/code-mode/types';
 import { useCodeGitDiffWatch } from '../../features/code-mode/useCodeGitDiffWatch';
 import { type SingleAgentToolTab } from '../../features/singleAgentPanelState';
+import { useBrowserAgentActivity } from '../../features/browserAgentActivity';
+import { closeDesktopBrowserTab, openFileInDesktopBrowser, useDesktopBrowserTabFlags } from '../../features/desktopBrowserFile';
 import { SubagentExpandedPanel } from '../subagent/SubagentExpandedPanel';
 import { SubagentStatusIcon } from '../subagent/SubagentStatusIcon';
 import { useSubagentStore, selectSubagents } from '../../stores/subagentStore';
 import { useMinWidth } from '../../hooks/useResponsive';
+import { DesktopBrowserPane } from '../DesktopBrowserPane';
 import './ToolPanel.css';
 import { applicationTasksToTeamTasks, EMPTY_APPLICATION_TASKS, useApplicationTaskStore } from '../../applicationPlugins/taskProgressStore';
 
@@ -309,6 +312,14 @@ export function ToolPanel({
   const floatingPanelRef = useRef<HTMLDivElement>(null);
 
   const isUltraWide = useMinWidth('ultraWide');
+  const isElectron = Boolean(window.jiuwenDesktop?.isElectron);
+  const hasBrowserAgentActivity = useBrowserAgentActivity(resolvedSessionId);
+  const desktopBrowserTabFlags = useDesktopBrowserTabFlags(resolvedSessionId);
+  const showBrowserTab =
+    isElectron && !desktopBrowserTabFlags.closed && (hasBrowserAgentActivity || desktopBrowserTabFlags.requested);
+  const handleTabClose = (tab: string) => {
+    if (tab === 'browser') closeDesktopBrowserTab();
+  };
 
   useEffect(() => {
     if (!onCloseFloating || isUltraWide) return;
@@ -439,6 +450,7 @@ export function ToolPanel({
                   }
                 : tab => setSingleAgentPanelActiveTab(tab as SingleAgentToolTab)
             }
+            onTabClose={handleTabClose}
             onCollapse={
               isTeam
                 ? () => {
@@ -459,8 +471,10 @@ export function ToolPanel({
                 : { key: 'subagents', label: t('subagent.title'), icon: <img src={teamIcon} width={16} height={16} aria-hidden="true" /> }
             }
             showMiddleTab={isTeam ? true : subagentCount > 0}
+            showBrowserTab={showBrowserTab}
             resolveActiveTab={(tab, count, review) => {
               if (tab === 'artifacts' && count > 0) return 'artifacts';
+              if (tab === 'browser') return showBrowserTab ? 'browser' : 'planning';
               if (isTeam) return tab === 'review' && !review ? 'planning' : tab;
               if (tab === 'subagents' && subagentCount > 0) return 'subagents';
               if (tab === 'review' && review) return 'review';
@@ -510,6 +524,7 @@ export function ToolPanel({
                 />
               )
             }
+            renderBrowserContent={() => <DesktopBrowserPane sessionId={resolvedSessionId} />}
           />
         </div>
       </div>
@@ -715,6 +730,8 @@ export function ToolPanel({
             emptyIllustration={emptyArtifactsIcon}
             renderStatusIcon={task => <FileIcon fileName={task.title ?? ''} size={16} className="shrink-0" />}
             onTaskClick={taskId => {
+              const artifact = sessionArtifacts.find(item => item.id === taskId);
+              if (artifact && openFileInDesktopBrowser({ name: artifact.name, download_url: artifact.downloadUrl })) return;
               expandTo('artifacts');
               if (isTeam) {
                 setTeamAreaSelectedArtifactId(taskId);
