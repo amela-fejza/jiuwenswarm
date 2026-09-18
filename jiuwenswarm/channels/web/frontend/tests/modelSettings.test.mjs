@@ -112,32 +112,49 @@ test('preset protocol mapping uses only the exact server fields', () => {
   assert.equal('endpoint_profile' in anthropic, false);
 });
 
-test('model context windows parse editable sizes and support the 1M lock switch', () => {
+test('model context windows stay editable and expose common presets', () => {
   const freshDraft = createModelDraft(undefined, catalog);
   assert.equal(freshDraft.context_window_tokens, '256K');
-  assert.equal(freshDraft.context_window_1m_enabled, false);
+  assert.equal('context_window_1m_enabled' in freshDraft, false);
 
   const saved = modelDraftToEntry(
-    { ...freshDraft, vendor_selection: CUSTOM_VENDOR_SELECTION, model_name: 'custom-model', context_window_tokens: '200k', api_key: 'secret', api_base: 'https://custom.example/v1' },
+    {
+      ...freshDraft,
+      vendor_selection: CUSTOM_VENDOR_SELECTION,
+      model_name: 'custom-model',
+      context_window_tokens: '200k',
+      api_key: 'secret',
+      api_base: 'https://custom.example/v1',
+    },
     undefined,
     catalog,
     true,
   );
   assert.equal(saved.context_window_tokens, 200 * 1024);
 
-  const locked = modelDraftToEntry(
-    { ...freshDraft, vendor_selection: CUSTOM_VENDOR_SELECTION, model_name: 'custom-model', context_window_tokens: '200k', context_window_1m_enabled: true, api_key: 'secret', api_base: 'https://custom.example/v1' },
+  const edited = modelDraftToEntry(
+    {
+      ...freshDraft,
+      vendor_selection: CUSTOM_VENDOR_SELECTION,
+      model_name: 'custom-model',
+      context_window_tokens: '200k',
+      api_key: 'secret',
+      api_base: 'https://custom.example/v1',
+    },
     undefined,
     catalog,
     true,
   );
-  assert.equal(locked.context_window_tokens, 1048576);
+  assert.equal(edited.context_window_tokens, 200 * 1024);
 
   const modelDialog = source('src/features/settings/modules/models/ModelDialog.tsx');
   assert.match(modelDialog, /name: 'context_window_tokens'/);
-  assert.match(modelDialog, /name: CONTEXT_WINDOW_1M_FIELD/);
-  assert.match(modelDialog, /disabled: contextWindow1mEnabled/);
+  assert.match(modelDialog, /<ContextWindowField/);
+  assert.doesNotMatch(modelDialog, /CONTEXT_WINDOW_1M_FIELD/);
   assert.match(modelDialog, /settingsPanel\.models\.contextWindowHint/);
+
+  const contextWindow = source('src/features/settings/modules/models/contextWindow.ts');
+  assert.match(contextWindow, /CONTEXT_WINDOW_PRESETS = \['128K', '256K', '512K', '1M'\]/);
 });
 
 test('switching providers clears credentials before applying the next connection preset', () => {
@@ -459,9 +476,20 @@ test('default and deletion operations preserve identity, group semantics, and re
   const target = { model_name: 'same', alias: 'second', is_default: false };
   const other = { model_name: 'other', alias: 'third', is_default: true };
   const agentOs = { model_name: 'backup', alias: 'backup', is_agentos: true };
-  const models = [primary, target, other, agentOs];
+  const loginFree = {
+    model_name: 'GLM-5.3',
+    alias: 'GLM-5.3',
+    is_free: true,
+    source: 'huawei-maas-login',
+    is_default: true,
+  };
+  const models = [loginFree, primary, target, other, agentOs];
 
   assert.deepEqual(getEditableModels(models), [primary, target, other]);
+  assert.equal(
+    getModelDisplayGroups(models).some((group) => group.items.some(({ model }) => model === loginFree)),
+    false,
+  );
   const displayGroups = getModelDisplayGroups([primary, other, target, agentOs]);
   assert.equal(displayGroups.length, 3);
   assert.deepEqual(
@@ -546,6 +574,7 @@ test('model Settings sources use the required RPCs without hardcoded vendor opti
   assert.doesNotMatch(dialog, /accountMode/);
   assert.doesNotMatch(page, /Promise\.all\(\[loadModels\(\), loadCatalog\(\)\]\)/);
   assert.doesNotMatch(page, /resolveModelPreset|flattenVendorCatalog/);
+  assert.match(operations, /isRuntimeGrantedModel/);
   assert.match(operations, /model\.is_agentos !== true/);
   assert.doesNotMatch(page, /config\.save_all/);
   assert.match(dialog, /'vendors\.fetch_models'/);
