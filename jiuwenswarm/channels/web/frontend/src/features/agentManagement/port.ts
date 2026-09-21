@@ -1,3 +1,4 @@
+import type { CatalogCacheMetadata, CatalogItems } from '../catalogCache';
 import type {
   AgentCatalogItem,
   AgentDetail,
@@ -57,27 +58,36 @@ export interface AgentCatalogListOptions {
   includeTeamCompatibility?: boolean;
 }
 
+export interface SkillListOptions {
+  includeTeamMarketplace?: boolean;
+  onTeamMarketplaceLoaded?: (options: SkillOption[], cache?: CatalogCacheMetadata) => void;
+}
+
 export interface AgentManagementClient {
   readonly source: AgentManagementSource;
-  listCatalog(options?: AgentCatalogListOptions): Promise<AgentCatalogItem[]>;
+  listCatalog(options?: AgentCatalogListOptions): Promise<CatalogItems<AgentCatalogItem>>;
   getDefinition(id: string): Promise<AgentDetail>;
   getDefinitionFiles(id: string): Promise<DefinitionFileEntry[]>;
   getDefinitionFile(id: string, relativePath: string): Promise<AgentFileContent>;
-  listSkillOptions(): Promise<SkillOption[]>;
+  listSkillOptions(options?: SkillListOptions): Promise<SkillOption[]>;
   listMcpOptions(): Promise<McpOption[]>;
+  installSkill(option: SkillOption): Promise<void>;
   createAgent(draft: AgentDraft): Promise<void>;
+  updateAgent(draft: AgentDraft): Promise<void>;
+  deleteDefinition(id: string): Promise<void>;
   importAgentTemplate(path: string): Promise<{ id: string }>;
   installDefinition(id: string): Promise<AgentInstallResult>;
   uninstallDefinition(id: string): Promise<{ notice?: string }>;
 }
 
 export interface AgentGroupListOptions {
-  filter?: 'builtin' | 'local' | 'all';
+  filter?: 'builtin' | 'builtin+hub' | 'local' | 'all';
+  cache_mode?: 'prefer_cache';
 }
 
 export interface AgentGroupManagementClient {
   readonly source: AgentManagementSource;
-  listGroups(options?: AgentGroupListOptions): Promise<AgentGroupCatalogItem[]>;
+  listGroups(options?: AgentGroupListOptions): Promise<CatalogItems<AgentGroupCatalogItem>>;
   getGroup(id: string): Promise<AgentGroupDetail>;
   getGroupFiles(id: string): Promise<DefinitionFileEntry[]>;
   getGroupFile(id: string, relativePath: string): Promise<AgentFileContent>;
@@ -113,11 +123,25 @@ export function resolveAgentGroupSelectionId(
   return agent.runtimePackageName.trim() || agent.id.trim();
 }
 
+/** Team selection is keyed by runtime package, even when catalog entries have different source IDs. */
+export function dedupeAgentGroupOptions(agents: AgentCatalogItem[]): AgentCatalogItem[] {
+  const bySelectionId = new Map<string, AgentCatalogItem>();
+  for (const agent of agents) {
+    const selectionId = resolveAgentGroupSelectionId(agent);
+    const previous = bySelectionId.get(selectionId);
+    if (!previous || (!previous.installed && agent.installed)) {
+      bySelectionId.set(selectionId, agent);
+    }
+  }
+  return Array.from(bySelectionId.values());
+}
+
 export function isAgentGroupAgentSelectable(
   agent: Pick<AgentCatalogItem, 'source' | 'installed' | 'teamCompatible'>,
   mode: 'leader' | 'member',
 ): boolean {
-  if (agent.source === 'hub' && (!agent.installed || !agent.teamCompatible)) return false;
+  if (!agent.installed) return false;
+  if (agent.source === 'hub' && !agent.teamCompatible) return false;
   return mode === 'leader'
     ? agent.teamCompatible?.leader !== false
     : agent.teamCompatible?.member !== false;
