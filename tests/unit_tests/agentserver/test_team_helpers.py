@@ -2987,9 +2987,10 @@ async def test_team_routing_replans_followup_without_replacing_session(
     assert request.params["mode"] == "team"
     assert _FakeManager.routing_metadata["team_routing"]["topology"] == "parallel"
     assert _FakeManager.interact_calls[0][0] == "sess-team-routed-followup"
-    assert _FakeManager.interact_calls[0][1].startswith(
-        "[Team routing directive]\nTopology: parallel"
-    )
+    delivered_query = _FakeManager.interact_calls[0][1]
+    assert "[Team routing directive]" in delivered_query
+    assert "Topology: parallel" in delivered_query
+    assert "Implement multiple independent components in parallel" in delivered_query
     assert len(chunks) == 2
 
 

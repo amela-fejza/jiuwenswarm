@@ -49,6 +49,8 @@ def route_team_query(
             key=lambda score: (-score.score, score.candidate_id),
         )
     )
+    if not topology_scores:
+        return None
     selected_score = topology_scores[0]
     fallback_reason = ""
     if selected_score.score < config.confidence_threshold:
@@ -77,11 +79,10 @@ def route_team_query(
         selected_roles = [config.default_role]
     selected_roles = selected_roles[: config.max_roles]
 
-    confidence = selected_score.score if not fallback_reason else selected_score.score
     return TeamTopologyDecision(
         topology=topology.topology_id,
         roles=tuple(selected_roles),
-        confidence=max(0.0, min(1.0, confidence)),
+        confidence=max(0.0, min(1.0, selected_score.score)),
         dispatch_mode=topology.dispatch_mode,
         enable_verification=topology.enable_verification,
         max_review_rounds=topology.max_review_rounds,
@@ -176,7 +177,10 @@ def _require_topology(
     options: tuple[TopologyOption, ...],
     topology_id: str,
 ) -> TopologyOption:
-    return next(option for option in options if option.topology_id == topology_id)
+    for option in options:
+        if option.topology_id == topology_id:
+            return option
+    raise ValueError(f"Unknown team topology: {topology_id}")
 
 
 def _append_unique(values: list[str], value: str) -> list[str]:

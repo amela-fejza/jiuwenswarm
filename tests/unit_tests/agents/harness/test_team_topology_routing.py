@@ -89,6 +89,10 @@ def test_routing_prompt_preserves_human_member_sender_prefix():
     assert "[User query]\ncheck this" in prompt
 
 
+def test_slash_commands_are_not_routed():
+    assert route_team_query("/compact", _enabled_config()) is None
+
+
 def test_config_rejects_duplicate_topology_ids():
     with pytest.raises(ValueError, match="Duplicate team routing topology"):
         team_routing_config_from_dict(
