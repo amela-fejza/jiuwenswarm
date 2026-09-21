@@ -14,11 +14,6 @@ DEFAULT_FINGERPRINT_EXTRACTION_BATCH_SIZE = 1
 DEFAULT_FINGERPRINT_EXTRACTION_BODY_LIMIT = None
 DEFAULT_FINGERPRINT_SCAN_MAX_DEPTH = None
 
-DEFAULT_FINGERPRINT_NORMALIZATION_WORKERS = 1
-DEFAULT_FINGERPRINT_NORMALIZATION_BATCH_SIZE = 1
-DEFAULT_FINGERPRINT_NORMALIZATION_DUPLICATE_THRESHOLD = 0.86
-DEFAULT_FINGERPRINT_NORMALIZATION_MAX_VOCAB_SIZE = None
-
 DEFAULT_BUILD_WORKERS = 1
 DEFAULT_BUILD_MATCHER_BATCH_SIZE = 12
 DEFAULT_BUILD_MAX_CANDIDATES_PER_SKILL_RELATION = 32
@@ -27,6 +22,13 @@ DEFAULT_BUILD_MIN_EDGE_CONFIDENCE = 0.5
 
 DEFAULT_SYMPHONY_ENABLED = False
 DEFAULT_EVOLUTION_ENABLED = False
+
+DEFAULT_FLOW_ENABLED = True
+DEFAULT_FLOW_MIN_EDGE_SUPPORT = 1
+DEFAULT_FLOW_MIN_EDGE_SUCCESS_RATE = 0.5
+DEFAULT_FLOW_MIN_SUCCESSES_CANDIDATE = 1
+DEFAULT_FLOW_MIN_SUCCESSES_VERIFIED = 3
+DEFAULT_FLOW_MIN_PACK_SUCCESS_RATE_VERIFIED = 0.8
 
 DEFAULT_ORCHESTRATION_MODE = "fast"
 DEFAULT_ORCHESTRATION_TOP_K = 3
@@ -37,7 +39,7 @@ DEFAULT_ORCHESTRATION_MIN_EDGE_CONFIDENCE = 0.5
 @dataclass(frozen=True)
 class SymphonyPathsConfig:
     skills_root: Path
-    score_dir: Path
+    graph_dir: Path
 
 
 @dataclass(frozen=True)
@@ -53,20 +55,9 @@ class FingerprintExtractionConfig:
 
 
 @dataclass(frozen=True)
-class FingerprintNormalizationConfig:
-    workers: int = DEFAULT_FINGERPRINT_NORMALIZATION_WORKERS
-    batch_size: int = DEFAULT_FINGERPRINT_NORMALIZATION_BATCH_SIZE
-    duplicate_name_similarity_threshold: float = (
-        DEFAULT_FINGERPRINT_NORMALIZATION_DUPLICATE_THRESHOLD
-    )
-    max_vocab_size: int | None = DEFAULT_FINGERPRINT_NORMALIZATION_MAX_VOCAB_SIZE
-
-
-@dataclass(frozen=True)
 class SymphonyFingerprintConfig:
     scan: FingerprintScanConfig
     extraction: FingerprintExtractionConfig
-    normalization: FingerprintNormalizationConfig
 
 
 @dataclass(frozen=True)
@@ -81,8 +72,19 @@ class SymphonyBuildConfig:
 
 
 @dataclass(frozen=True)
+class SymphonyFlowDistillConfig:
+    enabled: bool = DEFAULT_FLOW_ENABLED
+    min_edge_support: int = DEFAULT_FLOW_MIN_EDGE_SUPPORT
+    min_edge_success_rate: float = DEFAULT_FLOW_MIN_EDGE_SUCCESS_RATE
+    min_successes_candidate: int = DEFAULT_FLOW_MIN_SUCCESSES_CANDIDATE
+    min_successes_verified: int = DEFAULT_FLOW_MIN_SUCCESSES_VERIFIED
+    min_pack_success_rate_verified: float = DEFAULT_FLOW_MIN_PACK_SUCCESS_RATE_VERIFIED
+
+
+@dataclass(frozen=True)
 class SymphonyEvolutionConfig:
     enabled: bool = DEFAULT_EVOLUTION_ENABLED
+    flow: SymphonyFlowDistillConfig = SymphonyFlowDistillConfig()
 
 
 @dataclass(frozen=True)
@@ -119,29 +121,14 @@ def default_symphony_config() -> SymphonyConfig:
 
 
 def symphony_config_from_dict(raw: dict[str, Any] | None) -> SymphonyConfig:
-    data = raw if isinstance(raw, dict) else {}
-    paths = data.get("paths") if isinstance(data.get("paths"), dict) else {}
-    fingerprint = (
-        data.get("fingerprint") if isinstance(data.get("fingerprint"), dict) else {}
-    )
-    scan = fingerprint.get("scan") if isinstance(fingerprint.get("scan"), dict) else {}
-    extraction = (
-        fingerprint.get("extraction")
-        if isinstance(fingerprint.get("extraction"), dict)
-        else {}
-    )
-    normalization = (
-        fingerprint.get("normalization")
-        if isinstance(fingerprint.get("normalization"), dict)
-        else {}
-    )
-    build = data.get("build") if isinstance(data.get("build"), dict) else {}
-    evolution = (
-        data.get("evolution") if isinstance(data.get("evolution"), dict) else {}
-    )
-    orchestration = (
-        data.get("orchestration") if isinstance(data.get("orchestration"), dict) else {}
-    )
+    data = _mapping(raw)
+    paths = _mapping(data.get("paths"))
+    fingerprint = _mapping(data.get("fingerprint"))
+    scan = _mapping(fingerprint.get("scan"))
+    extraction = _mapping(fingerprint.get("extraction"))
+    build = _mapping(data.get("build"))
+    evolution = _mapping(data.get("evolution"))
+    orchestration = _mapping(data.get("orchestration"))
 
     return SymphonyConfig(
         enabled=_bool(data.get("enabled"), DEFAULT_SYMPHONY_ENABLED),
@@ -150,9 +137,9 @@ def symphony_config_from_dict(raw: dict[str, Any] | None) -> SymphonyConfig:
                 paths.get("skills_root"),
                 get_agent_workspace_dir() / "skills",
             ),
-            score_dir=_resolve_path(
-                paths.get("score_dir"),
-                get_agent_workspace_dir() / "symphony" / "score",
+            graph_dir=_resolve_path(
+                paths.get("graph_dir"),
+                get_agent_workspace_dir() / "symphony" / "graph",
             ),
         ),
         fingerprint=SymphonyFingerprintConfig(
@@ -174,24 +161,6 @@ def symphony_config_from_dict(raw: dict[str, Any] | None) -> SymphonyConfig:
                 body_limit=_optional_body_limit(
                     extraction.get("body_limit"),
                     DEFAULT_FINGERPRINT_EXTRACTION_BODY_LIMIT,
-                ),
-            ),
-            normalization=FingerprintNormalizationConfig(
-                workers=_positive_int(
-                    normalization.get("workers"),
-                    DEFAULT_FINGERPRINT_NORMALIZATION_WORKERS,
-                ),
-                batch_size=_positive_int(
-                    normalization.get("batch_size"),
-                    DEFAULT_FINGERPRINT_NORMALIZATION_BATCH_SIZE,
-                ),
-                duplicate_name_similarity_threshold=_clamped_float(
-                    normalization.get("duplicate_name_similarity_threshold"),
-                    DEFAULT_FINGERPRINT_NORMALIZATION_DUPLICATE_THRESHOLD,
-                ),
-                max_vocab_size=_optional_positive_int(
-                    normalization.get("max_vocab_size"),
-                    DEFAULT_FINGERPRINT_NORMALIZATION_MAX_VOCAB_SIZE,
                 ),
             ),
         ),
@@ -219,6 +188,32 @@ def symphony_config_from_dict(raw: dict[str, Any] | None) -> SymphonyConfig:
                 evolution.get("enabled"),
                 DEFAULT_EVOLUTION_ENABLED,
             ),
+            flow=SymphonyFlowDistillConfig(
+                enabled=_bool(
+                    evolution.get("flow", {}).get("enabled"),
+                    DEFAULT_FLOW_ENABLED,
+                ),
+                min_edge_support=_positive_int(
+                    evolution.get("flow", {}).get("min_edge_support"),
+                    DEFAULT_FLOW_MIN_EDGE_SUPPORT,
+                ),
+                min_edge_success_rate=_clamped_float(
+                    evolution.get("flow", {}).get("min_edge_success_rate"),
+                    DEFAULT_FLOW_MIN_EDGE_SUCCESS_RATE,
+                ),
+                min_successes_candidate=_positive_int(
+                    evolution.get("flow", {}).get("min_successes_candidate"),
+                    DEFAULT_FLOW_MIN_SUCCESSES_CANDIDATE,
+                ),
+                min_successes_verified=_positive_int(
+                    evolution.get("flow", {}).get("min_successes_verified"),
+                    DEFAULT_FLOW_MIN_SUCCESSES_VERIFIED,
+                ),
+                min_pack_success_rate_verified=_clamped_float(
+                    evolution.get("flow", {}).get("min_pack_success_rate_verified"),
+                    DEFAULT_FLOW_MIN_PACK_SUCCESS_RATE_VERIFIED,
+                ),
+            ),
         ),
         orchestration=SymphonyOrchestrationConfig(
             mode=_orchestration_mode(
@@ -241,6 +236,10 @@ def symphony_config_from_dict(raw: dict[str, Any] | None) -> SymphonyConfig:
     )
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _resolve_path(value: Any, default: Path) -> Path:
     text = str(value or "").strip()
     if not text:
@@ -254,12 +253,6 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, parsed)
-
-
-def _optional_positive_int(value: Any, default: int | None) -> int | None:
-    if value is None or str(value).strip() == "":
-        return default
-    return _positive_int(value, default or 1)
 
 
 def _optional_non_negative_int(value: Any, default: int | None) -> int | None:

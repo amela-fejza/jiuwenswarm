@@ -4,11 +4,12 @@
  * 单条消息显示，支持 TTS 朗读
  */
 
-import { useState, useCallback, useEffect, useRef, memo } from 'react';
+import { useState, useCallback, useContext, useEffect, useRef, useMemo, memo } from 'react';
 import type { ReactNode } from 'react';
 import {
   Check,
   Copy,
+  GitFork,
   Info,
   Square,
   Target,
@@ -21,10 +22,14 @@ import {
   FileDownloadItem,
   ContextCompressionRuntime,
   ContextCompressionSummary,
+  WebError,
 } from '../../types';
 import { StreamingContent } from './StreamingContent';
+import { FileDownloadMediaPreviewContext } from './FileDownloadMediaPreviewContext';
+import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
 import { ToolCallDisplay } from './ToolCallDisplay';
 import { MediaRenderer, stripUploadDocumentBlocks } from './MediaRenderer';
+import { stripSwarmflowAdvisory } from '../../utils/swarmflowAdvisory';
 import { A2UIMessageContent } from '../../features/a2ui/A2UIMessageContent';
 import { QaSummaryCard } from '../InteractionSlot/QaSummaryCard';
 import { isQaSummaryContent } from '../InteractionSlot/qaSummary';
@@ -37,10 +42,35 @@ import clsx from 'clsx';
 import { MarkdownRenderer } from '../../components/MarkdownRenderer';
 import { isTeamP2PMessageToUser, parseTeamEventMessage } from './teamEventUtils';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
+import { isTeamLeaderMember } from '../../utils/teamMemberAvatar';
+import { AgentAvatar } from '../AgentAvatar';
 import { ProactiveRecommendationCard } from './ProactiveRecommendationCard';
 import { fileArtifactId } from '../ArtifactsPanel';
 import { openArtifactPanel } from '../../features/teamPanelState';
+import { openSingleAgentPanel } from '../../features/singleAgentPanelState';
+import { openFileInDesktopBrowser } from '../../features/desktopBrowserFile';
 import { executeDesktopSave, type DesktopSaveApiResult } from '../../utils/desktopSave';
+import { FileIcon } from '../FileIcon';
+import { webRequest } from '../../services/webClient';
+import { useChatStore } from '../../stores/chatStore';
+import { useSessionStore } from '../../stores/sessionStore';
+import type { AgentGroupIdentity } from '../../features/agentManagement';
+import { extractTokenFromDownloadUrl } from '../../utils/fileDownloadDedup';
+import { isSkillPackageFile } from '../../utils/skillPackageFile';
+import {
+  resolveTeamLeaderDisplayName,
+  type TeamLeaderIdentity,
+} from '../../features/teamLeaderIdentity';
+
+function openArtifactPanelForActiveMode(selectedArtifactId: string): void {
+  const sessionId = useChatStore.getState().activeSessionId;
+  const mode = useSessionStore.getState().runtimes[sessionId ?? '']?.mode ?? 'agent';
+  if (mode === 'team' || mode === 'auto_harness') {
+    openArtifactPanel(selectedArtifactId);
+    return;
+  }
+  openSingleAgentPanel('artifacts', selectedArtifactId);
+}
 
 export const MarkdownMessageBody = memo(function MarkdownMessageBody({
   content,
@@ -60,24 +90,76 @@ export const MarkdownMessageBody = memo(function MarkdownMessageBody({
   );
 });
 
+function CompactCommandDivider({ output }: { output: string }) {
+  return (
+    <div
+      className="chat-compact-divider animate-fade-in"
+      data-testid="chat-panel-compact-divider"
+    >
+      <span className="chat-compact-divider__line" aria-hidden="true" />
+      <span className="chat-compact-divider__label">{output}</span>
+      <span className="chat-compact-divider__line" aria-hidden="true" />
+    </div>
+  );
+}
+
 export function TeamMemberMessageFrame({
   member,
   showAvatar = true,
   children,
   contentClassName,
+  teamLeaderIdentity,
+  teamGroupIdentity,
 }: {
   member?: string;
   showAvatar?: boolean;
   children: ReactNode;
   contentClassName?: string;
+  teamLeaderIdentity?: TeamLeaderIdentity | null;
+  teamGroupIdentity?: AgentGroupIdentity | null;
 }) {
+  const { i18n } = useTranslation();
+  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const teamMembers = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamMembers);
+  // 头像旁的成员名：leader 使用显式 session identity，否则固定 Jiuwen；其他成员
+  // 使用名册 display name，查不到退回 member_id。
+  // 订阅名册而非 getState 直读，成员迟到时名字能跟着刷新（同 TeamMemberAvatar 的考量）。
+  const memberName = useMemo(() => {
+    const id = member?.trim() ?? '';
+    if (!id) return '';
+    if (isTeamLeaderMember(id)) {
+      return teamGroupIdentity?.displayName?.trim()
+        || resolveTeamLeaderDisplayName(teamLeaderIdentity, i18n.language)
+        || 'Jiuwen';
+    }
+    const known = teamMembers?.find((item) => item.member_id === id);
+    return known?.name?.trim() || id;
+  }, [i18n.language, member, teamGroupIdentity, teamLeaderIdentity, teamMembers]);
+
+  const actorIdentity = isTeamLeaderMember(member)
+    ? teamGroupIdentity
+      ? {
+          agentTemplateId: teamGroupIdentity.id,
+          displayName: teamGroupIdentity.displayName,
+          ...(teamGroupIdentity.avatarUrl ? { avatar: teamGroupIdentity.avatarUrl } : {}),
+        }
+      : teamLeaderIdentity ?? undefined
+    : undefined;
+
   return (
-    <div className="team-member-message animate-fade-in">
-      {/* 始终占住头像列，避免 showAvatar 在多轮/折叠间切换时整列塌掉看起来像「头像消失」。 */}
-      <div className="team-member-message__header" aria-hidden={!showAvatar}>
-        {showAvatar ? <TeamMemberAvatar member={member} /> : null}
-      </div>
-      <div className={clsx('team-member-message__body', contentClassName)}>
+    <div className="team-member-message animate-fade-in" data-testid="chat-panel-team-member-message">
+      {/* 与单 agent 的 assistant-row 一致：无头像时整列不渲染，正文直接对齐最左边。 */}
+      {showAvatar ? (
+        <div className="team-member-message__header" data-testid="chat-panel-team-member-message-header">
+          {actorIdentity ? (
+            <AgentAvatar identityOverride={actorIdentity} alt="" />
+          ) : (
+            <TeamMemberAvatar member={member} />
+          )}
+          {memberName ? <span className="chat-avatar-name">{memberName}</span> : null}
+        </div>
+      ) : null}
+      <div className={clsx('team-member-message__body', contentClassName)} data-testid="chat-panel-team-member-message-body">
         {children}
       </div>
     </div>
@@ -88,40 +170,60 @@ function TeamLeaderPlainTextMessage({
   member = 'team_leader',
   content,
   messageId,
+  timestamp,
   isStreaming = false,
+  hideMeta = false,
   showAvatar = true,
   fileItems,
   disableA2UIInteraction = false,
+  teamLeaderIdentity,
+  teamGroupIdentity,
 }: {
   member?: string;
   content: string;
   messageId: string;
+  timestamp: string;
   isStreaming?: boolean;
+  hideMeta?: boolean;
   showAvatar?: boolean;
   fileItems?: FileDownloadItem[];
   disableA2UIInteraction?: boolean;
+  teamLeaderIdentity?: TeamLeaderIdentity | null;
+  teamGroupIdentity?: AgentGroupIdentity | null;
 }) {
   return (
     <TeamMemberMessageFrame
       member={member}
       showAvatar={showAvatar}
+      teamLeaderIdentity={teamLeaderIdentity}
+      teamGroupIdentity={teamGroupIdentity}
     >
       {fileItems && fileItems.length > 0 && (
         <FileDownloadList
           files={fileItems}
-          className="w-full md:w-1/2"
-          onPreview={(index) => openArtifactPanel(fileArtifactId(fileItems[index]))}
+          className="chat-message-file-list"
+          onPreview={(index) => {
+            if (openFileInDesktopBrowser(fileItems[index])) return;
+            openArtifactPanelForActiveMode(fileArtifactId(fileItems[index]));
+          }}
         />
       )}
-      <div className="team-member-message__plain">
+      <div className="team-member-message__plain" data-testid="chat-panel-team-leader-message-plain">
         <A2UIMessageContent
           content={content}
           messageId={messageId}
           isStreaming={isStreaming}
           disableInteraction={disableA2UIInteraction}
-          testId="team-leader-message-body"
         />
       </div>
+      {!isStreaming && !hideMeta && (
+        <div
+          data-testid="chat-panel-message-meta"
+          className="flex items-center gap-1 text-sm mt-2 text-text-meta justify-start"
+        >
+          <span data-testid="chat-panel-message-timestamp">{formatTimestamp(timestamp)}</span>
+        </div>
+      )}
     </TeamMemberMessageFrame>
   );
 }
@@ -148,12 +250,16 @@ export function ContextCompressionLines({
     .join('\n');
 
   return (
-    <div className="context-compression-lines">
+    <div className="context-compression-lines" data-testid="chat-panel-context-compression-lines">
       {showRuntime && (
-        <div className={clsx(
-          'mt-2 flex items-center gap-1.5 text-xs',
-          isFailed ? 'text-danger' : 'text-text-muted'
-        )}>
+        <div
+          className={clsx(
+            'mt-2 flex items-center gap-1.5 text-xs',
+            isFailed ? 'text-danger' : 'text-text-muted'
+          )}
+          data-testid="chat-panel-context-compression-runtime"
+          data-variant={isRunning ? 'running' : isFailed ? 'failed' : 'done'}
+        >
           <span className={clsx(isRunning && 'context-compression-running-text')}>
             {isRunning
               ? contextCompressionRunningText(t, runtime?.processor, runtime?.summary ?? '')
@@ -165,6 +271,7 @@ export function ContextCompressionLines({
         <div
           className="mt-2 flex items-center gap-1.5 text-xs text-text-muted"
           title={detailText || undefined}
+          data-testid="chat-panel-context-compression-summary"
         >
           <Info className="h-3.5 w-3.5" strokeWidth={1.8} />
           <span>
@@ -188,7 +295,12 @@ function renderRichContent(content: string): ReactNode[] {
       parts.push(content.slice(lastIndex, match.index));
     }
     parts.push(
-      <span key={`skill-${key++}`} className="chat-message-skill-chip">
+      <span
+        key={`skill-${key++}`}
+        className="chat-message-skill-chip"
+        data-testid="chat-panel-message-skill-chip"
+        data-variant={match[1]}
+      >
         <span className="chat-message-skill-chip__icon" aria-hidden="true" />
         <span className="chat-message-skill-chip__label">{match[1]}</span>
       </span>
@@ -226,6 +338,11 @@ interface MessageItemProps {
   disableA2UIInteraction?: boolean;
   hideMeta?: boolean;
   enableAssistantAvatar?: boolean;
+  /** Explicit session-frozen identity override for Team leader rendering. */
+  teamLeaderIdentityOverride?: TeamLeaderIdentity | null;
+  /** Selected Expert Team identity for the top-level conversation surface. */
+  teamGroupIdentityOverride?: AgentGroupIdentity | null;
+  onForkFromMessage?: (message: Message) => Promise<void>;
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -235,6 +352,9 @@ export const MessageItem = memo(function MessageItem({
   disableA2UIInteraction = false,
   hideMeta = false,
   enableAssistantAvatar = false,
+  teamLeaderIdentityOverride,
+  teamGroupIdentityOverride,
+  onForkFromMessage,
 }: MessageItemProps) {
   const { t } = useTranslation();
   const {
@@ -250,12 +370,25 @@ export const MessageItem = memo(function MessageItem({
     mediaItems,
     fileItems,
     isGoalObjectiveMessage,
+    isCommandOutput,
+    commandName,
+    commandInput,
+    commandOutput,
+    agentTemplateName,
+    crossSession,
   } = message;
   const [hasAutoSpoken, setHasAutoSpoken] = useState(false);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [isForking, setIsForking] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const { tooltip, handlers: tooltipHandlers } = useAdaptiveTooltip({ placement: 'top' });
+  const activeSessionId = useChatStore((state) => state.activeSessionId);
+  const sessionTeamLeaderIdentity = useSessionStore(
+    (state) => state.runtimes[activeSessionId ?? '']?.teamLeaderIdentity ?? null
+  );
+  const teamLeaderIdentity = teamLeaderIdentityOverride ?? sessionTeamLeaderIdentity;
 
   // TTS
   const { isSpeaking, speak, stop, isSupported: ttsSupported } = useSpeechSynthesis({
@@ -332,7 +465,7 @@ export const MessageItem = memo(function MessageItem({
 
   const handleCopy = useCallback(async () => {
     if (!content) return;
-    const raw = role === 'user' ? stripUploadDocumentBlocks(content) : content;
+    const raw = role === 'user' ? stripUploadDocumentBlocks(stripSwarmflowAdvisory(content)) : content;
     if (!raw) return;
     const copyContent = a2uiContentToText(raw) || raw;
     try {
@@ -350,6 +483,18 @@ export const MessageItem = memo(function MessageItem({
     setCopied(true);
     window.setTimeout(() => setCopied(false), 2000);
   }, [content, role]);
+
+  const handleForkFromMessage = useCallback(async () => {
+    if (!onForkFromMessage || isForking) return;
+    setIsForking(true);
+    try {
+      await onForkFromMessage(message);
+    } catch {
+      window.alert(t('chatUi.forkFromMessageFailed'));
+    } finally {
+      setIsForking(false);
+    }
+  }, [isForking, message, onForkFromMessage, t]);
 
   // 自动朗读新消息（仅助手消息，由父组件通过 autoSpeak 控制）
   useEffect(() => {
@@ -372,9 +517,23 @@ export const MessageItem = memo(function MessageItem({
     });
   }, [stopGeneratedAudio, stop]);
 
-  // 主动推荐消息 - 使用特殊卡片样式
+  // 主动推荐消息 - 使用特殊卡片样式。外层沿用正常 agent 回复的布局（avatar 占位
+  // + gap + chat-bubble-wrapper），使卡片左右边缘与回复正文气泡对齐，避免卡片
+  // 左缘超出回复列。
   if (message.isProactiveRecommendation) {
-    return <ProactiveRecommendationCard message={message} />;
+    const withAssistantAvatar = enableAssistantAvatar;
+    return (
+      <div className={clsx('flex animate-rise justify-start', withAssistantAvatar && 'assistant-row')} data-testid="chat-panel-proactive-row">
+        {withAssistantAvatar && (
+          <div className="assistant-row__avatar" aria-hidden={!showAvatar} data-testid="chat-panel-proactive-avatar">
+            {showAvatar ? <TeamMemberAvatar member="team_leader" /> : null}
+          </div>
+        )}
+        <div className="chat-bubble-wrapper  min-w-0 flex-1" data-testid="chat-panel-proactive-bubble-wrapper">
+          <ProactiveRecommendationCard message={message} />
+        </div>
+      </div>
+    );
   }
 
   // 工具调用/结果消息
@@ -399,6 +558,29 @@ export const MessageItem = memo(function MessageItem({
 
   // 系统消息
   if (role === 'system') {
+    // slash 命令输出按命令类型路由：compact 使用时间线分隔条，
+    // 其余命令退回通用文本；isCommandOutput 标记不会影响其他 system 消息。
+    if (isCommandOutput) {
+      const newlineIdx = content.indexOf('\n');
+      const command = commandInput ?? (newlineIdx >= 0 ? content.slice(0, newlineIdx) : content);
+      const output = commandOutput ?? (newlineIdx >= 0 ? content.slice(newlineIdx + 1).trim() : '');
+      const normalizedCommandName = commandName || command.match(/^\/([\w-]+)/)?.[1]?.toLowerCase();
+
+      if (normalizedCommandName === 'compact') {
+        return <CompactCommandDivider output={output} />;
+      }
+
+      return (
+        <div className="flex justify-center my-2 animate-fade-in">
+          <div className="w-[85%] max-w-[44rem] px-2 py-0.5 text-xs leading-5 text-left text-text-muted">
+            <span className="font-mono">{command}</span>
+            {output && (
+              <span className="mt-0.5 block whitespace-pre-wrap break-words">{output}</span>
+            )}
+          </div>
+        </div>
+      );
+    }
  	     // 检查是否为 chat.session_result 事件
  	     if (content && content.startsWith('chat.session_result:')) {
  	       console.log('chat.session_result event:', content);
@@ -409,10 +591,11 @@ export const MessageItem = memo(function MessageItem({
  	         const { description, result } = sessionData;
  	         
  	         return (
- 	           <div className="chat-tool-card animate-rise">
+ 	           <div className="chat-tool-card animate-rise" data-testid="chat-panel-session-result-card">
  	             <div
  	               className="cursor-pointer"
  	               onClick={() => setIsExpanded(!isExpanded)}
+	               data-testid="chat-panel-session-result-card-header"
  	             >
  	               <div className="flex items-center gap-2">
  	                 <span className="w-5 h-5 rounded bg-accent-2-subtle text-accent-2 flex items-center justify-center text-sm">
@@ -420,7 +603,7 @@ export const MessageItem = memo(function MessageItem({
  	                     <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V19.5a2.25 2.25 0 002.25 2.25h.75m0-3h-3.75m0 0h-3.75m0 0H9m1.5 3h3.75m-3.75 0H9m1.5 3h3.75m-3.75 0H9m1.5 3h3.75m-3.75 0H9" />
  	                   </svg>
  	                 </span>
- 	                 <span className="font-mono text-sm font-medium text-text">
+ 	                 <span className="font-mono text-sm font-medium text-text" data-testid="chat-panel-session-result-card-title">
  	                   会话任务：【{description || '未知任务'}】已完成
  	                 </span>
  	                 <span className="text-text-muted text-sm">
@@ -429,9 +612,9 @@ export const MessageItem = memo(function MessageItem({
  	               </div>
  	             </div>
  	             {isExpanded && (
- 	               <div className="mt-2 p-2 rounded-md bg-card border border-border">
+ 	               <div className="mt-2 p-2 rounded-md bg-card border border-border" data-testid="chat-panel-session-result-card-details">
  	                 {description && (
- 	                   <div className="mb-2">
+ 	                   <div className="mb-2" data-testid="chat-panel-session-result-card-description">
  	                     <div className="font-mono text-xs text-text-muted mb-1">Description:</div>
  	                     <pre className="font-mono text-sm text-text overflow-x-auto whitespace-pre-wrap">
  	                       {description}
@@ -439,7 +622,7 @@ export const MessageItem = memo(function MessageItem({
  	                   </div>
  	                 )}
  	                 {result && (
- 	                   <div>
+ 	                   <div data-testid="chat-panel-session-result-card-result">
  	                     <div className="font-mono text-xs text-text-muted mb-1">Result:</div>
  	                     <pre className="font-mono text-sm text-text overflow-x-auto whitespace-pre-wrap max-h-60">
  	                       {result}
@@ -453,7 +636,7 @@ export const MessageItem = memo(function MessageItem({
  	       } catch (e) {
  	         // 如果解析失败，显示原始内容
  	         return (
- 	           <div className="flex justify-center my-4 animate-fade-in">
+ 	           <div className="flex justify-center my-4 animate-fade-in" data-testid="chat-panel-session-result-fallback">
  	             <div className="px-4 py-2 rounded-full bg-secondary border border-border text-text-muted text-sm">
  	               {content}
  	             </div>
@@ -473,32 +656,38 @@ export const MessageItem = memo(function MessageItem({
 	                 member={event.fromMember}
 	                 content={event.content}
 	                 messageId={id}
+	                 timestamp={timestamp}
+	                 isStreaming={isStreaming}
+	                 hideMeta={hideMeta}
 	                 showAvatar={showAvatar}
+	                 teamLeaderIdentity={teamLeaderIdentity}
+	                 teamGroupIdentity={teamGroupIdentityOverride}
 	               />
 	             );
 	           }
 	           
 	           // p2p 和 broadcast 消息展示
 	           return (
-	             <TeamMemberMessageFrame
+	               <TeamMemberMessageFrame
 	               member={event.fromMember}
 	               showAvatar={showAvatar}
+	               teamLeaderIdentity={teamLeaderIdentity}
 	             >
-	               <div className="team-member-message__card">
-	                 <div className="team-member-message__content">
+	               <div className="team-member-message__card" data-testid="chat-panel-team-event-card">
+	                 <div className="team-member-message__content" data-testid="chat-panel-team-event-card-content">
 	                   {event.isP2P && event.toMember && (
-	                     <span className="team-event-group-chip team-event-group-chip--p2p">
+	                     <span className="team-event-group-chip team-event-group-chip--p2p" data-testid="chat-panel-team-event-chip-p2p">
 	                       @{event.toMember}
 	                     </span>
 	                   )}
 	                   {event.isBroadcast && (
-	                     <span className="team-event-group-chip team-event-group-chip--broadcast">
+	                     <span className="team-event-group-chip team-event-group-chip--broadcast" data-testid="chat-panel-team-event-chip-broadcast">
 	                       {t('chat.teamBroadcastTarget')}
 	                     </span>
 	                   )}
 	                   <MarkdownMessageBody
 	                     content={event.content}
-	                     className="team-message-markdown team-message-markdown--inline"
+	                     className="team-message-markdown team-message-markdown--inline" data-testid="chat-panel-team-event-card-body"
 	                   />
 	                 </div>
 	               </div>
@@ -506,7 +695,7 @@ export const MessageItem = memo(function MessageItem({
 	           );
 	       }
 	       return (
-	         <div className="flex justify-center my-4 animate-fade-in">
+	         <div className="flex justify-center my-4 animate-fade-in" data-testid="chat-panel-team-event-fallback">
 	           <div className="px-4 py-2 rounded-full bg-secondary border border-border text-text-muted text-sm">
 	             {content}
 	           </div>
@@ -534,16 +723,20 @@ export const MessageItem = memo(function MessageItem({
 	           member="team_leader"
 	           content={messageContent || (isStreaming ? '正在接收中...' : '')}
 	           messageId={id}
+	           timestamp={timestamp}
 	           isStreaming={isStreaming}
+	           hideMeta={hideMeta}
 	           showAvatar={showAvatar}
 	           fileItems={fileItems}
 	           disableA2UIInteraction={disableA2UIInteraction}
+	           teamLeaderIdentity={teamLeaderIdentity}
+	           teamGroupIdentity={teamGroupIdentityOverride}
 	         />
 	       );
 	     }
 	     
     return (
-      <div className="flex justify-center my-4 animate-fade-in">
+      <div className="flex justify-center my-4 animate-fade-in" data-testid="chat-panel-system-message-bubble">
         <div className="px-4 py-2 rounded-full bg-secondary border border-border text-text-muted text-sm">
           {content}
         </div>
@@ -551,9 +744,10 @@ export const MessageItem = memo(function MessageItem({
     );
   }
 
-  // 用户/助手消息
+  // 用户/助手消息。用户气泡剔除机器注入的 advisory 后再去掉上传文档提示块，
+  // 历史渲染只展示用户真正输入的原文。
   const isUser = role === 'user';
-  const displayContent = isUser ? stripUploadDocumentBlocks(content) : content;
+  const displayContent = isUser ? stripSwarmflowAdvisory(stripUploadDocumentBlocks(content)) : content;
   const showTTS = Boolean(
     !isUser && !isStreaming && content && (ttsSupported || audioBase64)
   );
@@ -565,24 +759,43 @@ export const MessageItem = memo(function MessageItem({
   const hasBubbleContent = isUser
     ? hasDisplayText || isStreaming
     : Boolean(content) || Boolean(visibleMediaItems) || Boolean(visibleFileItems);
+  const showFork = Boolean(
+    onForkFromMessage &&
+      !isStreaming &&
+      (role === 'user' || role === 'assistant') &&
+      hasBubbleContent
+  );
 
   const withAssistantAvatar = !isUser && enableAssistantAvatar;
 
   return (
-    <div className={clsx(
-      'flex animate-rise',
+    <div
+    data-testid="chat-panel-message-row"
+    className={clsx(
+      'message-row flex animate-rise',
       isUser ? 'justify-end' : 'justify-start',
-      withAssistantAvatar && 'assistant-row'
+      withAssistantAvatar && 'assistant-row',
+      withAssistantAvatar && !showAvatar && 'assistant-row--no-avatar'
     )}>
-      {withAssistantAvatar && (
-        // 始终保留头像占位，与 team 布局一致，避免连续气泡时整列消失。
-        <div className="assistant-row__avatar" aria-hidden={!showAvatar}>
-          {showAvatar ? <TeamMemberAvatar member="team_leader" /> : null}
+      {withAssistantAvatar && showAvatar ? (
+        <div className="assistant-row__avatar" data-testid="chat-panel-assistant-row-avatar">
+          {role === 'assistant' && agentTemplateName ? (
+            <AgentAvatar agentId={agentTemplateName} alt="" />
+          ) : (
+            <TeamMemberAvatar member="team_leader" />
+          )}
         </div>
-      )}
-      <div className="chat-bubble-wrapper max-w-[82%] min-w-0">
+      ) : null}
+      <div
+        className={clsx(
+          'chat-bubble-wrapper  min-w-0',
+          isUser && 'flex-1',
+          !isUser && visibleFileItems && 'chat-bubble-wrapper--with-files'
+        )}
+        data-testid="chat-panel-bubble-wrapper"
+      >
         {!isUser && (
-          <div className="hidden" data-testid="thinking-summary" aria-hidden="true" />
+          <div className="hidden" data-testid="chat-panel-thinking-summary" aria-hidden="true" />
         )}
 
         {isUser && visibleMediaItems && (
@@ -594,11 +807,17 @@ export const MessageItem = memo(function MessageItem({
             className={clsx(
               'chat-bubble relative group',
               isUser ? 'user' : 'assistant',
+              !isUser && message.presentation === 'tool_result' && 'chat-bubble--tool-result',
               !isUser && !isStreaming && 'markdown',
               isStreaming && 'streaming'
             )}
-            data-testid={!isUser ? 'thinking-panel' : undefined}
+            data-testid="chat-panel-message-bubble"
+            data-variant={isUser ? 'user' : 'assistant'}
+            data-state={isStreaming ? 'streaming' : 'final'}
           >
+            {!isUser && message.presentation === 'tool_result' && (
+              <div className="chat-bubble__result-label">{t('chat.toolResultLabel', '工具结果')} · Jiuwen Core Agent</div>
+            )}
             {isStreaming ? (
               isUser ? (
                 <StreamingContent content={displayContent} />
@@ -609,14 +828,13 @@ export const MessageItem = memo(function MessageItem({
                   messageId={id}
                   isStreaming={true}
                   disableInteraction={disableA2UIInteraction}
-                  testId="thinking-body"
                 />
               )
             ) : (
               <>
                 {isUser ? (
                   hasDisplayText ? (
-                    <div className="chat-text">
+                    <div className="chat-text" data-testid="chat-panel-message-text">
                       <span className="whitespace-pre-wrap">{renderRichContent(displayContent)}</span>
                     </div>
                   ) : null
@@ -626,7 +844,6 @@ export const MessageItem = memo(function MessageItem({
                     content={content}
                     messageId={id}
                     disableInteraction={disableA2UIInteraction}
-                    testId="thinking-body"
                   />
                 )}
                 {!isUser && visibleMediaItems && (
@@ -635,7 +852,11 @@ export const MessageItem = memo(function MessageItem({
                 {visibleFileItems && (
                   <FileDownloadList
                     files={visibleFileItems}
-                    onPreview={(index) => openArtifactPanel(fileArtifactId(visibleFileItems[index]))}
+                    className="chat-message-file-list"
+                    onPreview={(index) => {
+                      if (openFileInDesktopBrowser(visibleFileItems[index])) return;
+                      openArtifactPanelForActiveMode(fileArtifactId(visibleFileItems[index]));
+                    }}
                   />
                 )}
               </>
@@ -643,54 +864,46 @@ export const MessageItem = memo(function MessageItem({
           </div>
         )}
 
-        {/* Token usage summary */}
-        {!isUser && !isStreaming && message.usageSummary && message.usageSummary.total_tokens > 0 && (
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-text-muted mt-1 mb-0.5">
-            <span>
-              {message.usageSummary.input_tokens.toLocaleString()} in /{' '}
-              {message.usageSummary.output_tokens.toLocaleString()} out /{' '}
-              {message.usageSummary.total_tokens.toLocaleString()} total
-            </span>
-            {message.usageSummary.total_cost != null && message.usageSummary.total_cost > 0 && (
-              <span>
-                ${message.usageSummary.input_cost?.toFixed(4)} in /{' '}
-                ${message.usageSummary.output_cost?.toFixed(4)} out /{' '}
-                ${message.usageSummary.total_cost.toFixed(4)} total
-              </span>
-            )}
-          </div>
-        )}
-
         {!isStreaming && !hideMeta && (
           <div
+            data-testid="chat-panel-message-meta"
             className={clsx(
-              'flex items-center gap-3 text-sm mt-2 text-text-muted',
+              'flex items-center gap-1 text-sm mt-2 text-text-meta',
               isUser ? 'justify-end' : 'justify-start'
             )}
           >
-            <span>{formatTimestamp(timestamp)}</span>
+            <span data-testid="chat-panel-message-timestamp">{formatTimestamp(timestamp)}</span>
 
             {isUser && isGoalObjectiveMessage && (
-              <span className="inline-flex items-center gap-1 rounded-full bg-secondary px-2 py-0.5 text-xs text-text-muted">
+              <span className="inline-flex items-center gap-1 rounded-full bg-secondary px-2 py-0.5 text-xs text-text-meta" data-testid="chat-panel-message-goal-badge">
                 <Target className="w-3 h-3" strokeWidth={2} />
                 {t('goal.badge')}
               </span>
             )}
 
+            {isUser && crossSession && (
+              <span
+                className="inline-flex items-center gap-1 rounded-full bg-secondary px-2 py-0.5 text-xs text-text-meta"
+                data-testid="chat-panel-message-cross-session-badge"
+                title={crossSession.sourceSessionId}
+              >
+                {t('crossSession.messageBadge', {
+                  title: crossSession.sourceTitle || crossSession.sourceSessionId,
+                })}
+              </span>
+            )}
+
             {showCopy && (
-              <div className="relative">
-                {copied && (
-                  <span className="animate-fade-in absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-xs text-text shadow-md">
-                    {t('chatUi.copied')}
-                  </span>
-                )}
+              <div className="relative" data-testid="chat-panel-message-copy">
                 <button
+                  data-testid="chat-panel-message-copy-btn"
+                  data-tooltip={copied ? t('chatUi.copied') : t('chatUi.copyMessage')}
+                  {...tooltipHandlers}
                   onClick={handleCopy}
                   className={clsx(
-                    'p-1.5 rounded-md ',
-                    copied ? 'text-accent' : 'hover:text-accent hover:bg-secondary'
+                    'px-1 py-1.5 rounded-md',
+                    copied ? 'text-accent' : 'hover:bg-secondary'
                   )}
-                  title={t('chatUi.copyMessage')}
                 >
                   {copied ? (
                     <Check className="w-4 h-4" strokeWidth={1.5} />
@@ -698,26 +911,54 @@ export const MessageItem = memo(function MessageItem({
                     <Copy className="w-4 h-4" strokeWidth={1.5} />
                   )}
                 </button>
+                {tooltip}
               </div>
             )}
 
             {showTTS && (
-              <button
-                onClick={handleSpeak}
-                className={clsx(
-                  'p-1.5 rounded-md ',
-                  isPlaying
-                    ? 'text-accent bg-accent/10'
-                    : 'hover:text-accent hover:bg-secondary'
-                )}
-                title={isPlaying ? t('chatUi.stopReading') : t('chatUi.readMessage')}
-              >
-                {isPlaying ? (
-                  <Square className="w-4 h-4 fill-current" strokeWidth={1.5} />
-                ) : (
-                  <Volume2 className="w-4 h-4" strokeWidth={1.5} />
-                )}
-              </button>
+              <div className="relative" data-testid="chat-panel-message-tts">
+                <button
+                  data-testid="chat-panel-message-tts-btn"
+                  data-variant={isPlaying ? 'playing' : 'idle'}
+                  data-tooltip={isPlaying ? t('chatUi.stopReading') : t('chatUi.readMessage')}
+                  {...tooltipHandlers}
+                  onClick={handleSpeak}
+                  className={clsx(
+                    'px-1 py-1.5 rounded-md ',
+                    isPlaying
+                      ? 'text-accent bg-accent/10'
+                      : 'hover:bg-secondary'
+                  )}
+                >
+                  {isPlaying ? (
+                    <Square className="w-4 h-4 fill-current" strokeWidth={1.5} />
+                  ) : (
+                    <Volume2 className="w-4 h-4" strokeWidth={1.5} />
+                  )}
+                </button>
+                {tooltip}
+              </div>
+            )}
+
+            {showFork && (
+              <div className="relative" data-testid="chat-panel-message-fork">
+                <button
+                  type="button"
+                  data-testid="chat-panel-message-fork-btn"
+                  data-tooltip={t('chatUi.forkFromMessage')}
+                  aria-label={t('chatUi.forkFromMessage')}
+                  {...tooltipHandlers}
+                  onClick={() => void handleForkFromMessage()}
+                  disabled={isForking}
+                  className={clsx(
+                    'px-1 py-1.5 rounded-md hover:bg-secondary',
+                    isForking && 'cursor-wait opacity-50'
+                  )}
+                >
+                  <GitFork className="w-4 h-4" strokeWidth={1.5} />
+                </button>
+                {tooltip}
+              </div>
             )}
           </div>
         )}
@@ -735,45 +976,48 @@ function formatFileSize(bytes: number | undefined): string {
   return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+function skillPackageDisplayName(file: FileDownloadItem): string {
+  const raw = (file.name || file.path || '').replace(/\\/g, '/').split('/').pop() || '';
+  return raw.replace(/(\.skill)?\.zip$/i, '').replace(/\.skill$/i, '') || raw || 'skill';
+}
+
+function resolveFileDownloadToken(file: FileDownloadItem): string | undefined {
+  const direct = file.download_token?.trim();
+  if (direct) return direct;
+  return extractTokenFromDownloadUrl(file.download_url)?.trim() || undefined;
+}
+
+function isImportOverwriteRequired(error: unknown): boolean {
+  const code = (error as WebError | undefined)?.code;
+  if (code === 'SKILL_IMPORT_OVERWRITE_REQUIRED' || code === 'SKILL_ALREADY_EXISTS') {
+    return true;
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  return msg.includes('已存在') || msg.includes('force=true') || msg.includes('IMPORT_OVERWRITE');
+}
+
+const SAVED_SKILLS_KEY = 'saved_skill_tokens';
+
+function persistSavedToken(token: string) {
+  try {
+    const raw = localStorage.getItem(SAVED_SKILLS_KEY);
+    const set = raw ? new Set<string>(JSON.parse(raw)) : new Set<string>();
+    set.add(token);
+    localStorage.setItem(SAVED_SKILLS_KEY, JSON.stringify([...set]));
+  } catch { /* ignore */ }
+}
+
+function getSavedSkillTokens(): Set<string> {
+  try {
+    const raw = localStorage.getItem(SAVED_SKILLS_KEY);
+    return raw ? new Set<string>(JSON.parse(raw)) : new Set<string>();
+  } catch { return new Set<string>(); }
+}
+
 function getFileExtension(name: string): string {
   const parts = name.split('.');
   if (parts.length < 2) return '';
   return parts[parts.length - 1].toUpperCase();
-}
-
-function getFileTypeConfig(mimeType: string | undefined, name: string) {
-  const ext = name.split('.').pop()?.toLowerCase() || '';
-  const mt = mimeType || '';
-  if (mt.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'].includes(ext))
-    return { label: 'IMG', bg: 'bg-[#3370ff]', icon: '🖼' };
-  if (mt.startsWith('audio/') || ['mp3', 'wav', 'aac', 'flac', 'ogg'].includes(ext))
-    return { label: 'AUDIO', bg: 'bg-[#7b67ee]', icon: '🎵' };
-  if (mt.startsWith('video/') || ['mp4', 'avi', 'mov', 'mkv', 'webm'].includes(ext))
-    return { label: 'VIDEO', bg: 'bg-[#f77234]', icon: '🎬' };
-  if (mt.includes('pdf') || ext === 'pdf')
-    return { label: 'PDF', bg: 'bg-[#f54a45]', icon: '📄' };
-  if (mt.includes('presentation') || mt.includes('ppt') || ['ppt', 'pptx'].includes(ext))
-    return { label: 'PPT', bg: '#FFFFFF', icon: (
-      <svg viewBox="0 0 1024 1024" className="w-7 h-7">
-        <path d="M145.6 0C100.8 0 64 36.8 64 81.6v860.8C64 987.2 100.8 1024 145.6 1024h732.8c44.8 0 81.6-36.8 81.6-81.6V324.8L657.6 0h-512z" fill="#E34221" />
-        <path d="M960 326.4v16H755.2s-100.8-20.8-99.2-108.8c0 0 4.8 92.8 97.6 92.8H960z" fill="#DC3119" />
-        <path d="M657.6 0v233.6c0 25.6 17.6 92.8 97.6 92.8H960L657.6 0z" fill="#FFFFFF" opacity=".5" />
-        <path d="M304 784h-54.4v67.2c0 6.4-4.8 11.2-11.2 11.2-6.4 0-12.8-4.8-12.8-11.2V686.4c0-9.6 8-17.6 17.6-17.6H304c38.4 0 59.2 25.6 59.2 57.6S340.8 784 304 784z m-3.2-94.4h-51.2v73.6h51.2c22.4 0 38.4-16 38.4-36.8 0-22.4-16-36.8-38.4-36.8zM480 784h-54.4v67.2c0 6.4-4.8 11.2-11.2 11.2-6.4 0-11.2-4.8-11.2-11.2V686.4c0-9.6 6.4-17.6 16-17.6H480c38.4 0 59.2 25.6 59.2 57.6S518.4 784 480 784z m-3.2-94.4h-49.6v73.6h49.6c22.4 0 38.4-16 38.4-36.8 0-22.4-16-36.8-38.4-36.8z m225.6 0h-52.8v161.6c0 6.4-4.8 11.2-11.2 11.2-6.4 0-12.8-4.8-12.8-11.2V689.6h-51.2c-6.4 0-11.2-4.8-11.2-11.2 0-4.8 4.8-9.6 11.2-9.6h128c6.4 0 11.2 4.8 11.2 11.2 0 4.8-4.8 9.6-11.2 9.6z" fill="#FFFFFF" />
-      </svg>
-    ) };
-  if (mt.includes('spreadsheet') || mt.includes('excel') || mt.includes('xlsx') || ['xls', 'xlsx', 'csv'].includes(ext))
-    return { label: 'XLS', bg: 'bg-[#2b9348]', icon: '📗' };
-  if (mt.includes('word') || mt.includes('document') || mt.includes('docx') || ['doc', 'docx'].includes(ext))
-    return { label: 'DOC', bg: 'bg-[#3370ff]', icon: '📝' };
-  if (mt.includes('zip') || mt.includes('compressed') || mt.includes('archive') || ['zip', 'rar', '7z', 'tar', 'gz'].includes(ext))
-    return { label: 'ZIP', bg: 'bg-[#8b5cf6]', icon: '📦' };
-  if (['txt', 'md', 'log'].includes(ext))
-    return { label: 'TXT', bg: 'bg-[#6b7280]', icon: '📃' };
-  if (['json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'cfg'].includes(ext))
-    return { label: 'CFG', bg: 'bg-[#6b7280]', icon: '⚙' };
-  if (['py', 'js', 'ts', 'java', 'go', 'rs', 'cpp', 'c', 'h'].includes(ext))
-    return { label: 'CODE', bg: 'bg-[#6b7280]', icon: '�' };
-  return { label: 'FILE', bg: 'bg-[#6b7280]', icon: '��' };
 }
 
 function FileDownloadList({
@@ -787,10 +1031,16 @@ function FileDownloadList({
 }) {
   const { t } = useTranslation();
   const [expiredSet, setExpiredSet] = useState<Set<number>>(new Set());
+  const mediaPreviewEnabled = useContext(FileDownloadMediaPreviewContext);
+  const [savingIndex, setSavingIndex] = useState<number | null>(null);
+  const [savedIndex, setSavedIndex] = useState<Set<number>>(new Set());
+  const [saveSuccessIndex, setSaveSuccessIndex] = useState<number | null>(null);
+  const sessionId = useChatStore((s) => s.activeSessionId);
 
   useEffect(() => {
     let cancelled = false;
     files.forEach((file, index) => {
+      if (!file.download_url) return;
       fetch(file.download_url, { method: 'HEAD' })
         .then((res) => {
           if (!cancelled && !res.ok) {
@@ -806,13 +1056,23 @@ function FileDownloadList({
     return () => { cancelled = true; };
   }, [files]);
 
-  const handleDownload = async (file: FileDownloadItem, index: number) => {
-    if (expiredSet.has(index)) return;
+  // 挂载时从 localStorage 恢复已保存的技能索引
+  useEffect(() => {
+    const savedTokens = getSavedSkillTokens();
+    if (savedTokens.size === 0) return;
+    const restored = new Set<number>();
+    files.forEach((file, index) => {
+      const token = resolveFileDownloadToken(file);
+      if (token && savedTokens.has(token)) restored.add(index);
+    });
+    if (restored.size > 0) setSavedIndex(restored);
+  }, [files]);
 
-    // 检查是否在 PyWebView 桌面环境中
+  const handleDownload = async (file: FileDownloadItem, index: number) => {
+    if (expiredSet.has(index) || !file.download_url) return;
+
     const pywebviewApi = (window as Window & { pywebview?: { api?: { download_file?: (url: string, filename: string) => DesktopSaveApiResult } } }).pywebview?.api;
     if (pywebviewApi?.download_file) {
-      // 桌面端：通过 webview API 下载
       const outcome = await executeDesktopSave(() =>
         pywebviewApi.download_file!(file.download_url, file.name || 'download')
       );
@@ -821,7 +1081,6 @@ function FileDownloadList({
       }
       return;
     }
-    // 浏览器模式：使用标准 <a> 标签下载
     const link = document.createElement('a');
     link.href = file.download_url;
     link.download = file.name || '';
@@ -830,87 +1089,198 @@ function FileDownloadList({
     document.body.removeChild(link);
   };
 
+  const handleSaveSkill = async (file: FileDownloadItem, index: number) => {
+    if (expiredSet.has(index) || savingIndex !== null || savedIndex.has(index)) return;
+    const downloadToken = resolveFileDownloadToken(file);
+    if (!downloadToken) return;
+    if (!sessionId) {
+      window.alert('当前无活跃会话，无法保存 Skill');
+      return;
+    }
+
+    const importParams = (force: boolean) => ({
+      download_token: downloadToken,
+      force,
+      session_id: sessionId,
+    });
+
+    setSavingIndex(index);
+    try {
+      await webRequest('skills.import_local', importParams(false));
+      persistSavedToken(downloadToken);
+      setSavedIndex((prev) => new Set(prev).add(index));
+      setSaveSuccessIndex(index);
+      setTimeout(() => setSaveSuccessIndex(null), 2000);
+    } catch (error) {
+      if (isImportOverwriteRequired(error)) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        const overwrite = window.confirm(`${errorMsg}\n是否覆盖保存？`);
+        if (!overwrite) return;
+        try {
+          await webRequest('skills.import_local', importParams(true));
+          persistSavedToken(downloadToken);
+          setSavedIndex((prev) => new Set(prev).add(index));
+          setSaveSuccessIndex(index);
+          setTimeout(() => setSaveSuccessIndex(null), 2000);
+        } catch (err2) {
+          console.error('skills.import_local force error:', err2);
+          window.alert(err2 instanceof Error ? err2.message : String(err2));
+        }
+      } else {
+        console.error('skills.import_local error:', error);
+        window.alert(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      setSavingIndex(null);
+    }
+  };
+
   return (
-    <div className={clsx('mt-2 space-y-2', className)}>
+    <div data-testid="chat-panel-file-download-list"
+    className={clsx('mt-2 space-y-2', className)}>
       {files.map((file, index) => {
-        const typeConfig = getFileTypeConfig(file.mime_type, file.name);
         const ext = getFileExtension(file.name);
         const expired = expiredSet.has(index);
+        const isSkill = isSkillPackageFile(file);
+        const displayName = isSkill ? skillPackageDisplayName(file) : file.name;
+        const downloadToken = resolveFileDownloadToken(file);
+        const isSaving = savingIndex === index;
+        const isSaved = savedIndex.has(index);
+        const isImage = !isSkill && Boolean(file.mime_type && file.mime_type.startsWith('image/')) && Boolean(file.download_url);
+        const isVideo = !isSkill && Boolean(file.mime_type && file.mime_type.startsWith('video/')) && Boolean(file.download_url);
+        const showImagePreview = mediaPreviewEnabled && isImage && !expired;
+        const showVideoPreview = mediaPreviewEnabled && isVideo && !expired;
+        const showPreview = showImagePreview || showVideoPreview;
         return (
           <div
             key={`${file.name}-${index}`}
+            data-testid="chat-panel-file-download-item"
+            data-variant={file.name}
             className={clsx(
-              'flex items-center gap-3 rounded-lg border px-3 py-2.5  ',
+              'chat-panel-file-download-item group',
+              showPreview && 'chat-panel-file-download-item--with-preview',
               expired
-                ? 'border-border/50 bg-card/50 cursor-not-allowed opacity-60'
-                : clsx(
-                  'border-border bg-card',
-                  onPreview && 'cursor-pointer group hover:border-border-hover hover:shadow-md'
-                )
+                ? 'chat-panel-file-download-item--expired'
+                : !onPreview && 'chat-panel-file-download-item--no-preview',
             )}
             onClick={() => {
               if (!expired) onPreview?.(index);
             }}
           >
+            <div className="chat-panel-file-download-item__row">
             <button
               type="button"
+              data-testid="chat-panel-file-download-preview"
               className="flex min-w-0 flex-1 items-center gap-3 text-left"
               disabled={expired || !onPreview}
               onClick={(event) => {
                 event.stopPropagation();
                 onPreview?.(index);
               }}
-              title={onPreview ? t('artifacts.openPreview', { name: file.name }) : undefined}
-              aria-label={onPreview ? t('artifacts.openPreview', { name: file.name }) : undefined}
+              title={onPreview ? t('artifacts.openPreview', { name: displayName }) : undefined}
+              aria-label={onPreview ? t('artifacts.openPreview', { name: displayName }) : undefined}
             >
-              <div className={`flex-shrink-0 w-10 h-10 rounded-lg ${typeConfig.bg} flex items-center justify-center`}>
-                {typeof typeConfig.icon === 'string' ? (
-                  <span className="text-white text-base leading-none select-none">{typeConfig.icon}</span>
-                ) : (
-                  typeConfig.icon
-                )}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="text-sm font-medium text-text leading-snug truncate">{file.name}</div>
-                <div className="flex items-center gap-1.5 mt-0.5">
-                  <span className="inline-flex items-center px-1 py-px rounded text-[10px] font-mono font-medium text-text-muted bg-secondary leading-none">
-                    {ext || typeConfig.label}
-                  </span>
-                  <span className="text-xs text-text-muted">{formatFileSize(file.size)}</span>
+              {isSkill ? (
+                <div className="flex-shrink-0 w-6 h-6 rounded-lg bg-accent-subtle flex items-center justify-center">
+                  <svg className="w-5 h-5 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.8}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
+                  </svg>
+                </div>
+              ) : (
+                <FileIcon fileName={file.name} size={24} className="flex-shrink-0 select-none" />
+              )}
+              <div className="flex-1 min-w-0" data-testid="chat-panel-file-download-info">
+                <div className="text-sm font-medium text-text leading-snug truncate" data-testid="chat-panel-file-download-name">{displayName}</div>
+                <div className="flex items-center gap-1.5 mt-0.5" data-testid="chat-panel-file-download-meta">
+                  {!isSkill && (
+                    <span className="inline-flex items-center px-1 py-px rounded text-[10px] font-mono font-medium text-text-muted bg-secondary leading-none" data-testid="chat-panel-file-download-ext">
+                      {ext || 'FILE'}
+                    </span>
+                  )}
+                  <span className="text-xs text-text-muted" data-testid="chat-panel-file-download-size">{formatFileSize(file.size)}</span>
                   {expired && (
-                    <span className="inline-flex items-center px-1 py-px rounded text-[10px] font-mono font-medium text-danger bg-danger/10 leading-none">
+                    <span className="inline-flex items-center px-1 py-px rounded text-[10px] font-mono font-medium text-danger bg-danger/10 leading-none" data-testid="chat-panel-file-download-expired">
                       {t('chatUi.fileExpired')}
                     </span>
                   )}
                 </div>
               </div>
             </button>
-            <button
-              type="button"
-              className={clsx(
-                'flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center  ',
-                expired
-                  ? 'text-text-muted/40'
-                  : 'text-text-muted hover:text-accent hover:bg-accent-subtle'
-              )}
-              disabled={expired}
-              onClick={(event) => {
-                event.stopPropagation();
-                void handleDownload(file, index);
-              }}
-              title={t('artifacts.download')}
-              aria-label={t('artifacts.download')}
-            >
-              {expired ? (
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-                </svg>
-              ) : (
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
-                </svg>
-              )}
-            </button>
+            {isSkill ? (
+              <div className="flex-shrink-0 flex items-center gap-2">
+                {saveSuccessIndex === index && (
+                  <span className="text-xs font-medium text-green-600 whitespace-nowrap">保存成功</span>
+                )}
+                <button
+                  type="button"
+                  className={clsx(
+                    'flex-shrink-0 px-3 h-8 rounded-lg flex items-center justify-center text-sm font-medium transition-colors',
+                    expired || isSaved
+                      ? 'text-text-muted/40 cursor-not-allowed'
+                      : isSaving
+                        ? 'text-text-muted cursor-wait'
+                        : 'text-accent hover:bg-accent-subtle'
+                  )}
+                  disabled={expired || isSaving || isSaved || !downloadToken}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void handleSaveSkill(file, index);
+                  }}
+                  title={isSaved ? '已保存' : '保存'}
+                >
+                  {isSaving ? '保存中...' : isSaved ? '已保存' : '保存'}
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                data-testid="chat-panel-file-download-btn"
+                className={clsx(
+                  'flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center  ',
+                  expired
+                    ? 'text-text-muted/40'
+                    : 'text-text-muted hover:text-accent hover:bg-accent-subtle'
+                )}
+                disabled={expired}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void handleDownload(file, index);
+                }}
+                title={t('artifacts.download')}
+                aria-label={t('artifacts.download')}
+              >
+                {expired ? (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+                  </svg>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                  </svg>
+                )}
+              </button>
+            )}
+            </div>
+            {showImagePreview && (
+              <img
+                src={file.download_url}
+                alt={displayName}
+                className="chat-panel-file-download-image-preview"
+                data-testid="chat-panel-file-download-image-preview"
+                loading="lazy"
+              />
+            )}
+            {showVideoPreview && (
+              <video
+                controls
+                preload="metadata"
+                className="chat-panel-file-download-video-preview"
+                data-testid="chat-panel-file-download-video-preview"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <source src={file.download_url} type={file.mime_type} />
+              </video>
+            )}
           </div>
         );
       })}

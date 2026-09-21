@@ -1735,7 +1735,8 @@ async def test_gateway_server_handle_raw_message_forwards_request():
     assert msg.session_id == "sess-3"
     assert msg.req_method == ReqMethod.CHAT_SEND
     assert msg.params.get("content") == "hello"
-    assert msg.mode.value == "agent"
+    # P2 起 Mode.from_raw 经 DEPRECATION_MAP 静默映射:agent.fast → agent.work.normal。
+    assert msg.mode.value == "agent.work.normal"
     assert ws.sent_frames == []
 
 
@@ -2188,10 +2189,13 @@ async def test_gateway_agent_switch_local_handler_updates_connection(
 
     class _FakeThirdAgent(ThirdAgent):
         def normalize_agent_type(self, raw):
-            return str(raw or "jiuwenswarm").strip().lower() or "jiuwenswarm"
+            agent_type = str(raw or "").strip()
+            if not agent_type or agent_type.lower() == "jiuwenswarm":
+                return "jiuwenswarm"
+            return agent_type
 
-        async def thirdagent_list(self, *, user_id, current_agent_type=""):
-            del user_id, current_agent_type
+        async def thirdagent_list(self, *, user_id, current_agent_type="", access_mode=""):
+            del user_id, current_agent_type, access_mode
             return {"ok": True, "payload": {"agents": []}}
 
         async def thirdagent_switch(self, *, user_id, agent_type, session_id="", params=None):
@@ -2306,8 +2310,8 @@ async def test_gateway_agent_switch_rejects_unsupported_type(_third_agent_regist
     from jiuwenswarm.gateway.routing.third_agent import ThirdAgent
 
     class _FakeThirdAgent(ThirdAgent):
-        async def thirdagent_list(self, *, user_id, current_agent_type=""):
-            del user_id, current_agent_type
+        async def thirdagent_list(self, *, user_id, current_agent_type="", access_mode=""):
+            del user_id, current_agent_type, access_mode
             return {"ok": True, "payload": {"agents": []}}
 
         async def thirdagent_switch(self, *, user_id, agent_type, session_id="", params=None):

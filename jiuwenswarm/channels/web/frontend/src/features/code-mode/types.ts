@@ -55,6 +55,9 @@ export interface GitDiffSummary {
   is_dirty: boolean;
   stats: GitDiffStats;
   files: Record<string, GitDiffFile>;
+  /** 实际变更文件数超过预览上限（files_limit）时为 true，stats.files_changed 仍是实际总数 */
+  files_truncated?: boolean;
+  files_limit?: number;
 }
 
 export interface GitDiffStats {
@@ -94,6 +97,46 @@ export interface GitTurnDiffList {
   total: number;
 }
 
+export type GitTurnChangeAction = 'discard' | 'redo';
+
+export interface GitDiscardTurnChangesResult {
+  session_id: string;
+  turn_index: number;
+  change_set_id: string | null;
+  restored_files: string[];
+  deleted_files: string[];
+  errors: unknown[];
+  file_ops_truncated: boolean;
+  global_file_ops_truncated: false;
+  partial: boolean;
+}
+
+export interface GitRedoTurnChangesResult {
+  session_id: string;
+  turn_index: number;
+  change_set_id: string | null;
+  redone_files: string[];
+  deleted_files: string[];
+  errors: unknown[];
+  partial: boolean;
+}
+
+export interface GitCommitResult {
+  committed: true;
+  commit_hash: string | null;
+  amended: boolean;
+  status: GitRepoStatus;
+}
+
+export interface GitPushResult {
+  pushed: true;
+  remote: string;
+  branch: string | null;
+  deleted: boolean;
+  upstream_set: boolean;
+  status: GitRepoStatus;
+}
+
 export type CodeReviewTarget =
   | {
       source: 'last_turn';
@@ -110,6 +153,8 @@ export interface GitDiffRepoInfo {
   branch: string | null;
   head: string | null;
   transient: boolean;
+  /** 仓库根是项目目录的父目录（项目目录位于外层仓库之内）时为 true */
+  repo_is_parent_of_project?: boolean;
 }
 
 export interface GitDiffWatchSnapshot {

@@ -5,8 +5,11 @@
 注意：工具权限护栏已切换为 openjiuwen 实现；此处保留同名导出以维持兼容。
 """
 
-from openjiuwen.harness.rails.security.tool_security_rail import PermissionInterruptRail
+from openjiuwen.harness.rails.security import PermissionInterruptRail
 from jiuwenswarm.agents.harness.common.rails.avatar_rail import AvatarPromptRail
+from jiuwenswarm.agents.harness.common.rails.browser_task_prompt_rail import (
+    BrowserTaskPromptRail,
+)
 from jiuwenswarm.agents.harness.common.rails.project_memory_rail import ProjectMemoryRail
 from jiuwenswarm.agents.harness.common.rails.response_prompt_rail import ResponsePromptRail
 from jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail import RuntimePromptRail
@@ -25,6 +28,7 @@ __all__ = [
     "MultimodalImageRail",
     "PermissionInterruptRail",
     "AvatarPromptRail",
+    "BrowserTaskPromptRail",
     "ProjectMemoryRail",
     "ResponsePromptRail",
     "RuntimePromptRail",

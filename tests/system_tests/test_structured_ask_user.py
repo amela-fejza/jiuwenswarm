@@ -142,11 +142,22 @@ class TestStructuredAskUserToolSchema:
         assert _QUESTIONS_ITEM_SCHEMA["required"] == ["question"]
         assert props["question"]["minLength"] == 1
         options_schema = props["options"]
-        assert options_schema["maxItems"] == 4
-        assert options_schema["anyOf"] == [{"maxItems": 0}, {"minItems": 2}]
-        option_schema = options_schema["items"]
-        assert option_schema["required"] == ["label"]
-        assert option_schema["properties"]["label"]["minLength"] == 1
+        # Moonshot/Kimi requires type within each anyOf branch. Gemini also
+        # requires each array branch to declare items rather than inheriting it
+        # from the parent schema.
+        assert "type" not in options_schema
+        assert "items" not in options_schema
+        branches = options_schema["anyOf"]
+        assert len(branches) == 2
+        assert branches[0]["type"] == "array"
+        assert branches[0]["maxItems"] == 0
+        assert branches[1]["type"] == "array"
+        assert branches[1]["minItems"] == 2
+        assert branches[1]["maxItems"] == 4
+        for branch in branches:
+            option_schema = branch["items"]
+            assert option_schema["required"] == ["label"]
+            assert option_schema["properties"]["label"]["minLength"] == 1
 
     @staticmethod
     def test_tool_card_name_is_ask_user():
@@ -499,6 +510,25 @@ class TestConfirmAndPermissionInterrupts:
         assert result is not None
         assert result["source"] == "permission_interrupt"
         assert "write_file" in result["questions"][0]["question"]
+        assert result["questions"][0]["header"].startswith("权限审批")
+
+    @staticmethod
+    def test_query_tool_permission_interrupt_is_not_ask_user():
+        """A query argument does not make a non-ask_user tool an ask-user interrupt."""
+        message = "**工具 `memory_search` 需要授权才能执行**\n\n请确认是否允许该操作。"
+        result = convert_interactions_to_ask_user_question([
+            {
+                "id": "req_memory_search",
+                "value": {
+                    "tool_name": "memory_search",
+                    "message": message,
+                    "tool_args": {"query": "篮球"},
+                },
+            }
+        ])
+        assert result is not None
+        assert result["source"] == "permission_interrupt"
+        assert "memory_search" in result["questions"][0]["question"]
         assert result["questions"][0]["header"].startswith("权限审批")
 
     @staticmethod

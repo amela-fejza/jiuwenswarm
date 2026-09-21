@@ -4,11 +4,18 @@ import { A2UIProvider } from '@a2ui/react';
 import type { A2UIClientEventMessage } from '@a2ui/react';
 import { injectStyles } from '@a2ui/react/styles';
 import App from './App.tsx'
+import { ShareImageExportRunner } from './features/shareImageExport'
+import { openSourceSettingsPageDefinition } from './features/settings/registry/openSourceDefinition'
+import type { SettingsRequest } from './features/settings/services/settingsContract'
 import { dispatchA2UIAction } from './features/a2ui/actionBridge';
+import { installDesktopLocalFilesBridge } from './features/workspace/localFilePicker';
 import './styles/foundation.css'
 import './styles/themes/default/light.css'
 import './index.css'
 import './features/a2ui/a2ui.css'
+
+// Durable desktop drop bridge — must exist before ChatPanel mounts / effect cleanup.
+installDesktopLocalFilesBridge();
 
 function flagA2UIIconFontAvailability() {
   if (typeof document === 'undefined' || !('fonts' in document)) {
@@ -34,8 +41,23 @@ function handleA2UIAction(message: A2UIClientEventMessage) {
   void dispatchA2UIAction(message);
 }
 
+function resolveOpenSourceSettingsRequest(request: SettingsRequest): SettingsRequest {
+  return request
+}
+
+const runnerJobId = window.location.pathname === '/share-export-runner'
+  ? new URLSearchParams(window.location.search).get('job_id')?.trim() || null
+  : null
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <A2UIProvider onAction={handleA2UIAction}>
-    <App />
+    {runnerJobId ? (
+      <ShareImageExportRunner jobId={runnerJobId} />
+    ) : (
+      <App
+        settingsPageDefinition={openSourceSettingsPageDefinition}
+        resolveSettingsRequest={resolveOpenSourceSettingsRequest}
+      />
+    )}
   </A2UIProvider>,
 )

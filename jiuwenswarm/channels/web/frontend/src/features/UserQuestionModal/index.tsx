@@ -10,13 +10,12 @@ import { useChatStore } from '../../stores';
 import { Question, UserAnswer } from '../../types';
 
 interface UserQuestionModalProps {
-  onSubmit: (requestId: string, answers: UserAnswer[], source?: string) => void;
+  onSubmit: (requestId: string, answers: UserAnswer[], source?: string) => Promise<boolean>;
 }
 
 export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
   const { t } = useTranslation();
-  const pendingQuestion = useChatStore((s) => s.runtimes[s.activeSessionId ?? '']?.pendingQuestion ?? null);
-  const setPendingQuestion = useChatStore((s) => s.setPendingQuestion);
+  const pendingQuestion = useChatStore((s) => s.runtimes[s.activeSessionId ?? '']?.pendingQuestions[0] ?? null);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const [answers, setAnswers] = useState<Map<number, UserAnswer>>(new Map());
 
@@ -91,26 +90,32 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
       }
     );
 
-    onSubmit(pendingQuestion.request_id, finalAnswers, pendingQuestion.source);
-    setAnswers(new Map());
+    void onSubmit(pendingQuestion.request_id, finalAnswers, pendingQuestion.source).then(
+      (accepted) => {
+        if (accepted) setAnswers(new Map());
+      },
+    );
   }, [pendingQuestion, answers, onSubmit]);
 
   // 取消/关闭
   const handleCancel = useCallback(() => {
-    if (activeSessionId) setPendingQuestion(activeSessionId, null);
+    if (activeSessionId && pendingQuestion) {
+      useChatStore.getState().consumePendingQuestion(activeSessionId, pendingQuestion);
+    }
     setAnswers(new Map());
-  }, [activeSessionId, setPendingQuestion]);
+  }, [activeSessionId, pendingQuestion]);
 
   if (!pendingQuestion) {
     return null;
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" data-testid="user-question-modal">
       {/* 背景遮罩 */}
       <div
         className="absolute inset-0 bg-black/60"
         onClick={handleCancel}
+        data-testid="user-question-modal-backdrop"
       />
 
       {/* 弹窗内容 */}
@@ -120,10 +125,12 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
           backgroundColor: 'var(--color-surface-card)',
           boxShadow: 'var(--effect-shadow-xl)',
         }}
+        data-testid="user-question-modal-dialog"
       >
         {/* 标题栏 */}
         <div
           className="px-6 py-4 flex items-center gap-4"
+          data-testid="user-question-modal-header"
           style={{
             backgroundColor: 'var(--color-surface-panel-strong)',
             borderBottom: '1px solid var(--color-border-default)',
@@ -153,12 +160,14 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
             <h2
               className="text-lg font-semibold"
               style={{ color: 'var(--color-text-strong)' }}
+              data-testid="user-question-modal-title"
             >
               {t('userQuestion.title')}
             </h2>
             <p
               className="text-sm"
               style={{ color: 'var(--color-text-secondary)' }}
+              data-testid="user-question-modal-subtitle"
             >
               {t('userQuestion.subtitle')}
             </p>
@@ -172,6 +181,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
             maxHeight: '50vh',
             backgroundColor: 'var(--color-surface-card)',
           }}
+          data-testid="user-question-modal-questions"
         >
           {pendingQuestion.questions.map((question, qIndex) => (
             <QuestionItem
@@ -188,6 +198,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
         {/* 操作按钮 */}
         <div
           className="px-6 py-4 flex justify-end gap-3"
+          data-testid="user-question-modal-actions"
           style={{
             backgroundColor: 'var(--color-surface-panel-strong)',
             borderTop: '1px solid var(--color-border-default)',
@@ -196,6 +207,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
           <button
             onClick={handleCancel}
             className="px-4 py-2 text-sm font-medium rounded-lg "
+            data-testid="user-question-modal-cancel"
             style={{
               color: 'var(--color-text-secondary)',
               backgroundColor: 'transparent',
@@ -214,6 +226,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
           <button
             onClick={handleSubmit}
             className="px-5 py-2 text-sm font-medium text-text-inverse rounded-lg  hover:opacity-90"
+            data-testid="user-question-modal-submit"
             style={{
               background: 'linear-gradient(135deg, var(--color-action-primary), var(--color-brand-secondary))',
             }}
@@ -251,21 +264,23 @@ function QuestionItem({
   const selectedOptions = answer?.selected_options || [];
 
   return (
-    <div className="mb-6 last:mb-0">
+    <div className="mb-6 last:mb-0" data-testid="user-question-modal-question" data-variant={questionIndex}>
       {/* 问题标题 */}
-      <div className="mb-3">
+      <div className="mb-3" data-testid="user-question-modal-question-header">
         <span
           className="inline-block px-2 py-0.5 text-xs font-medium rounded mb-2"
           style={{
             color: 'var(--color-action-primary)',
             backgroundColor: 'var(--color-action-primary-subtle)',
           }}
+          data-testid="user-question-modal-question-badge"
         >
           {question.header}
         </span>
         <p
           className="font-medium"
           style={{ color: 'var(--color-text-strong)' }}
+          data-testid="user-question-modal-question-text"
         >
           {question.question}
         </p>
@@ -273,6 +288,7 @@ function QuestionItem({
           <p
             className="text-xs mt-1"
             style={{ color: 'var(--color-text-secondary)' }}
+            data-testid="user-question-modal-multi-select-hint"
           >
             {t('userQuestion.multiSelect')}
           </p>
@@ -280,7 +296,7 @@ function QuestionItem({
       </div>
 
       {/* 选项列表 */}
-      <div className="space-y-2">
+      <div className="space-y-2" data-testid="user-question-modal-options">
         {question.options.map((option, oIndex) => {
           const isSelected = selectedOptions.includes(option.label);
           return (
@@ -294,6 +310,8 @@ function QuestionItem({
                 )
               }
               className="w-full text-left px-4 py-3 rounded-lg "
+              data-testid="user-question-modal-option"
+              data-variant={option.label}
               style={{
                 backgroundColor: isSelected
                   ? 'var(--color-action-primary-subtle)'
@@ -348,6 +366,7 @@ function QuestionItem({
         <button
           onClick={() => setShowCustomInput(!showCustomInput)}
           className="w-full text-left px-4 py-3 rounded-lg "
+          data-testid="user-question-modal-custom-option"
           style={{
             backgroundColor: showCustomInput
               ? 'var(--color-action-primary-subtle)'
@@ -388,12 +407,13 @@ function QuestionItem({
 
         {/* 自定义输入框 */}
         {showCustomInput && (
-          <div className="mt-2 ml-8">
+          <div className="mt-2 ml-8" data-testid="user-question-modal-custom-input">
             <textarea
               value={answer?.custom_input || ''}
               onChange={(e) => onCustomInput(questionIndex, e.target.value)}
               placeholder={t('userQuestion.customPlaceholder')}
               className="w-full px-3 py-2 text-sm rounded-lg resize-none focus:outline-none"
+              data-testid="user-question-modal-custom-input-field"
               style={{
                 backgroundColor: 'var(--color-surface-elevated)',
                 border: '1px solid var(--color-border-default)',

@@ -160,6 +160,8 @@ Best for:
 2. **Local import (web UI)**
 
    Left sidebar → **Skills** → **Import local skill** in the top-right, enter the server-side local skill path (a `SKILL.md` file or a skill directory) in the dialog, then confirm.
+
+   > **Requirements**: the source must be an **absolute path** or a `~/...` path; `~` is expanded against the JiuwenClaw service process user's home directory on the server, not the browser user's local machine. Other relative paths are rejected. The resolved source must not be under a system/sensitive directory (e.g. `/etc`, `~/.ssh`, `C:\Windows`) or contain symbolic links. Operators may tighten the built-in blacklist via the `IMPORT_LOCAL_FORBIDDEN_DIRS` env var (comma-separated absolute paths). The `SKILL.md` must start with a `---` YAML frontmatter block containing both `name` and `description` — bare `.md` files or directories without a valid `SKILL.md` frontmatter are not importable.
    ![Local skill import](../assets/images/current-ui-en/12-Skills-My-Skills.png)
 
 3. **Manual copy (optional)**
@@ -167,8 +169,12 @@ Best for:
    Copy skill folder into:
 
    ```text
-   C:\Users\<username>\.jiuwenswarm\service_default\agent_default\jiuwenswarm_workspace\skills\
+   ~/.jiuwenswarm/agent/workspace/skills/
    ```
+
+   > **Path note**: `~` represents the user home directory. On Windows, the actual path is `C:\Users\<username>\.jiuwenswarm\agent\workspace\skills\`; on Linux/macOS, it's `/home/<username>/.jiuwenswarm/agent/workspace/skills/`. In container deployment mode, the path may vary depending on mount configuration.
+
+   > **Agent Team mode shares this same library**: teams and team members keep no `skills/` directory and no copies of their own, only a visibility declaration stating which skills of this library they may see (by default, all of them). Installing a skill once therefore makes it available to single agents and team members alike. See the "Team Skills" section of [Agent Team](AgentTeam.md) for how to narrow a member's visibility.
 
 4. **Verify**
 
@@ -205,13 +211,17 @@ In the **My Skills** list, each entry shows:
 
 In the list, use **View skill experience** to browse evolution entries for that skill, one record at a time.
 
+![Open Skill experience from the Skill list](../assets/images/skill演进_技能经验入口.png)
+
 **Each entry typically includes:**
 - **Type**: the content category, such as usage instructions, examples, or troubleshooting
 - **Improvement target**: the Skill area the experience improves, such as the description, body, or scripts
 - **Created at**: when the experience record was generated
 - **Experience content**: the concrete improvement guidance
 
-> **How to see data:** When a skill already has saved evolution experience, **View skill experience** becomes available in the skill list. If there is no data yet, that skill has no saved evolution records. Records can be generated manually with `/evolve <skill_name> [user_query]`, or automatically in failure/correction scenarios after enabling **Auto-detect evolution signals** under **Self-Evolution Configuration**. See [Configuration](Configuration.md) and [Skill self-evolution](SkillSelfEvolution.md).
+![Inspect and edit Skill experience](../assets/images/skill演进_技能经验.png)
+
+> **How to see data:** When a skill already has saved evolution experience, **View skill experience** becomes available in the skill list. If there is no data yet, that skill has no saved evolution records. After enabling **Skill self-evolution**, use `/evolve <skill_name> [user_intent]` to start a review immediately. The system also judges whether failures, corrections, and other task evidence justify suggesting evolution. Experience is saved only after the review and approval workflow is complete. See [Configuration](Configuration.md) and [Skill self-evolution](SkillSelfEvolution.md).
 
 > **Why it helps:** Skill experience reflects self-evolution and improvements from real use, so you can judge ongoing usefulness and maintainers get actionable input.
 
@@ -257,10 +267,12 @@ The agent lists installed skill names, sources, versions, and related info.
 **Method 3: File path**
 
 ```text
-C:\Users\<username>\.jiuwenswarm\service_default\agent_default\jiuwenswarm_workspace\skills\
+~/.jiuwenswarm/agent/workspace/skills/
 ```
 
 Each subfolder is one skill.
+
+> **Path note**: `~` represents the user home directory. On Windows, the actual path is `C:\Users\<username>\.jiuwenswarm\agent\workspace\skills\`; on Linux/macOS, it's `/home/<username>/.jiuwenswarm/agent/workspace/skills/`. In container deployment mode, the path may vary depending on mount configuration.
 
 #### View skill details
 

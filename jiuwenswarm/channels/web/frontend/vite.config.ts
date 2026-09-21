@@ -2,12 +2,13 @@ import type { Plugin } from 'vite'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import svgr from 'vite-plugin-svgr'
-import { spawnSync } from 'child_process'
-import { createHash } from 'node:crypto'
+import { spawn, spawnSync, type ChildProcess } from 'child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { ServerResponse } from 'http'
 import path from 'path'
 import fs from 'fs'
+import os from 'os'
 
 type ConfigWithLogger = { logger?: { error?: (msg: string, opts?: { error?: Error }) => void } }
 
@@ -150,7 +151,7 @@ function safeStringify(v: unknown): string {
 
 
 /**
- * file-api 使用的项目根目录，需与后端 get_root_dir() 一致，前端编辑的 HEARTBEAT.md 才会被心跳读到。
+ * file-api 使用的项目根目录，需与后端 get_root_dir() 一致。
  * 优先级：环境变量 > 已存在的用户工作区 ~/.jiuwenswarm > 仓库根。
  */
 function resolveProjectRootDir(): string {
@@ -294,12 +295,25 @@ function validateFileDownloadToken(token: string): { path: string } | null {
 
   try {
     const payload = JSON.parse(Buffer.from(payloadBase64, 'base64url').toString('utf8')) as Record<string, unknown>
-    if (
-      typeof payload.path !== 'string' ||
-      !payload.path ||
-      typeof payload.sid !== 'string'
-    ) return null
-    return { path: payload.path }
+    // 普通 file download token：携带 path 字段
+    if (typeof payload.path === 'string' && payload.path && typeof payload.sid === 'string') {
+      return { path: payload.path }
+    }
+    // skill_content_image token：携带 name + relative_path，需解析为绝对路径
+    if (String(payload.purpose || '').trim() === 'skill_content_image') {
+      const name = String(payload.name || '').trim()
+      const relativePath = String(payload.relative_path || '').trim()
+      if (!name || !relativePath) return null
+      const rootDir = resolveProjectRootDir()
+      const skillDir = path.resolve(rootDir, 'agent', 'workspace', 'skills', name)
+      const fullPath = path.resolve(skillDir, relativePath)
+      // 安全检查：确保路径在 skills 目录下
+      const skillsRoot = path.resolve(rootDir, 'agent', 'workspace', 'skills')
+      const rel = path.relative(skillsRoot, fullPath)
+      if (rel.startsWith('..') || path.isAbsolute(rel)) return null
+      return { path: fullPath }
+    }
+    return null
   } catch {
     return null
   }
@@ -433,6 +447,7 @@ function devWsTrafficLogger(): Plugin {
 /** 将文件读取接口挂到 Vite dev server，避免额外占用 3003 端口 */
 function devFileContentApi(): Plugin {
   const projectRootDir = resolveProjectRootDir()
+  const sourceRepoRootDir = path.resolve(__dirname, '../../../..')
   const workspaceRootDir = path.resolve(projectRootDir, 'agent')
   const sessionsRootDir = path.resolve(workspaceRootDir, 'sessions')
   const agentTeamsRootDir = path.resolve(projectRootDir, '.agent_teams')
@@ -441,6 +456,105 @@ function devFileContentApi(): Plugin {
   const generateAgentFoldersScriptPath = path.resolve(__dirname, '../../../scripts/generate-agent-folders.js')
   // dev 模式默认开启调试视图，与“前端 dev 即调试模式”一致。
   let wsDisableCompress = true
+  type DevShareImageJob = {
+    jobId: string
+    sessionId: string
+    filename: string
+    state: 'queued' | 'running' | 'completed' | 'failed'
+    phase: string
+    error: string | null
+    updatedAt: number
+    directory: string
+    snapshotPath: string
+    resultPath: string
+    process: ChildProcess | null
+  }
+  const shareImageJobs = new Map<string, DevShareImageJob>()
+  const shareImageJobTtlMs = 60 * 60 * 1000
+
+  const writeJson = (res: ServerResponse, statusCode: number, payload: unknown) => {
+    res.statusCode = statusCode
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.setHeader('cache-control', 'no-store')
+    res.end(JSON.stringify(payload))
+  }
+
+  const buildShareSnapshot = (sessionId: string) => {
+    const sessionDir = path.resolve(sessionsRootDir, sessionId)
+    const relativeSessionPath = path.relative(sessionsRootDir, sessionDir)
+    if (relativeSessionPath.startsWith('..') || path.isAbsolute(relativeSessionPath)) {
+      throw new Error('history_not_found')
+    }
+
+    const jsonlHistoryPath = path.resolve(sessionDir, 'history.jsonl')
+    const legacyHistoryPath = path.resolve(sessionDir, 'history.json')
+    const historyPath = fs.existsSync(jsonlHistoryPath) ? jsonlHistoryPath : legacyHistoryPath
+    if (!fs.existsSync(sessionDir) || !fs.existsSync(historyPath)) {
+      throw new Error('history_not_found')
+    }
+
+    const historyText = fs.readFileSync(historyPath, 'utf-8')
+    const historyRaw = historyPath.endsWith('.jsonl')
+      ? historyText
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as unknown)
+      : (JSON.parse(historyText) as unknown)
+    if (!Array.isArray(historyRaw)) {
+      throw new Error('invalid_history_shape')
+    }
+
+    let title = path.basename(sessionDir)
+    const metadataPath = path.resolve(sessionDir, 'metadata.json')
+    if (fs.existsSync(metadataPath)) {
+      const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf-8')) as { title?: unknown }
+      if (typeof metadata.title === 'string' && metadata.title.trim()) {
+        title = metadata.title.trim()
+      }
+    }
+    if (title === path.basename(sessionDir)) {
+      for (const record of historyRaw) {
+        if (!record || typeof record !== 'object') continue
+        const item = record as { role?: unknown; content?: unknown }
+        if (item.role === 'user' && typeof item.content === 'string' && item.content.trim()) {
+          title = item.content.trim().replace(/\n/g, ' ').slice(0, 80)
+          break
+        }
+      }
+    }
+
+    const now = new Date()
+    const filename = `jiuwenswarm-share-${now.toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-')}.png`
+    return {
+      filename,
+      snapshot: {
+        session_id: sessionId,
+        metadata: { title, exported_at: now.toISOString(), filename },
+        records: historyRaw,
+      },
+    }
+  }
+
+  const cleanupShareImageJobs = () => {
+    const cutoff = Date.now() - shareImageJobTtlMs
+    for (const [jobId, job] of shareImageJobs) {
+      if (job.updatedAt >= cutoff || (job.state !== 'completed' && job.state !== 'failed')) continue
+      shareImageJobs.delete(jobId)
+      fs.rmSync(job.directory, { recursive: true, force: true })
+    }
+  }
+  const findActiveShareImageJob = (sessionId: string) => Array.from(shareImageJobs.values()).find(
+    job => job.sessionId === sessionId && (job.state === 'queued' || job.state === 'running'),
+  )
+  const shareImageJobStatus = (job: DevShareImageJob) => ({
+    job_id: job.jobId,
+    session_id: job.sessionId,
+    filename: job.filename,
+    state: job.state,
+    phase: job.phase,
+    error: job.error,
+  })
   const isMarkdownFile = (targetPath: string) => {
     const ext = path.extname(targetPath).toLowerCase()
     return ext === '.md' || ext === '.mdx'
@@ -460,6 +574,227 @@ function devFileContentApi(): Plugin {
   return {
     name: 'dev-file-content-api',
     configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const requestUrl = new URL(req.url || '/', 'http://localhost')
+        if (!requestUrl.pathname.startsWith('/share-api/jobs')) {
+          next()
+          return
+        }
+        cleanupShareImageJobs()
+
+        if (requestUrl.pathname === '/share-api/jobs') {
+          if (req.method === 'GET' || req.method === 'HEAD') {
+            const sessionId = (requestUrl.searchParams.get('session_id') || '').trim()
+            if (!sessionId) {
+              writeJson(res, 400, { error: 'missing_session_id' })
+              return
+            }
+            const activeJob = findActiveShareImageJob(sessionId)
+            if (!activeJob) {
+              writeJson(res, 404, { error: 'active_job_not_found' })
+              return
+            }
+            writeJson(res, 200, shareImageJobStatus(activeJob))
+            return
+          }
+          if (req.method !== 'POST') {
+            writeJson(res, 405, { error: 'method_not_allowed' })
+            return
+          }
+          const chunks: Buffer[] = []
+          let receivedBytes = 0
+          req.on('data', (chunk: Buffer) => {
+            receivedBytes += chunk.length
+            if (receivedBytes <= 64 * 1024) chunks.push(chunk)
+          })
+          req.on('end', () => {
+            if (receivedBytes > 64 * 1024) {
+              writeJson(res, 413, { error: 'request_too_large' })
+              return
+            }
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}') as {
+                session_id?: unknown
+                locale?: unknown
+              }
+              const sessionId = typeof body.session_id === 'string' ? body.session_id.trim() : ''
+              if (!sessionId) {
+                writeJson(res, 400, { error: 'missing_session_id' })
+                return
+              }
+              const activeJob = findActiveShareImageJob(sessionId)
+              if (activeJob) {
+                writeJson(res, 200, { ...shareImageJobStatus(activeJob), reused: true })
+                return
+              }
+              const locale = typeof body.locale === 'string' && body.locale.trim() ? body.locale.trim() : 'zh'
+              const { filename, snapshot } = buildShareSnapshot(sessionId)
+              const jobId = randomUUID().replace(/-/g, '')
+              const directory = fs.mkdtempSync(path.join(os.tmpdir(), `jiuwenswarm-share-${jobId}-`))
+              const snapshotPath = path.resolve(directory, 'snapshot.json')
+              const resultPath = path.resolve(directory, filename)
+              fs.writeFileSync(snapshotPath, JSON.stringify({ filename, locale, snapshot }), 'utf-8')
+              const job: DevShareImageJob = {
+                jobId,
+                sessionId,
+                filename,
+                state: 'queued',
+                phase: 'snapshot_ready',
+                error: null,
+                updatedAt: Date.now(),
+                directory,
+                snapshotPath,
+                resultPath,
+                process: null,
+              }
+              shareImageJobs.set(jobId, job)
+
+              const address = server.httpServer?.address()
+              const port = typeof address === 'object' && address ? address.port : frontendPort
+              const child = spawn(
+                'uv',
+                [
+                  'run',
+                  'python',
+                  '-m',
+                  'jiuwenswarm.channels.web.share_image_export',
+                  '--base-url',
+                  `http://127.0.0.1:${port}`,
+                  '--job-id',
+                  jobId,
+                  '--output',
+                  resultPath,
+                ],
+                {
+                  cwd: sourceRepoRootDir,
+                  env: { ...process.env, PYTHONUNBUFFERED: '1' },
+                  stdio: ['ignore', 'pipe', 'pipe'],
+                },
+              )
+              job.process = child
+              job.state = 'running'
+              job.phase = 'launching'
+              let stdoutBuffer = ''
+              let stderrTail = ''
+              child.stdout?.on('data', (chunk: Buffer) => {
+                stdoutBuffer += chunk.toString('utf-8')
+                const lines = stdoutBuffer.split(/\r?\n/)
+                stdoutBuffer = lines.pop() || ''
+                for (const line of lines) {
+                  try {
+                    const event = JSON.parse(line) as { phase?: unknown; error?: unknown; filename?: unknown }
+                    if (typeof event.phase === 'string') job.phase = event.phase
+                    if (typeof event.error === 'string') job.error = event.error
+                    if (typeof event.filename === 'string' && event.filename.trim()) {
+                      const candidate = event.filename.trim()
+                      const filename = path.basename(candidate)
+                      const resultPath = path.resolve(job.directory, filename)
+                      if (
+                        candidate !== filename
+                        || !/^[a-zA-Z0-9._-]+\.(?:png|zip)$/i.test(filename)
+                        || path.dirname(resultPath) !== path.resolve(job.directory)
+                      ) {
+                        job.error = 'share_export_result_path_invalid'
+                      } else {
+                        job.filename = filename
+                        job.resultPath = resultPath
+                      }
+                    }
+                    job.updatedAt = Date.now()
+                  } catch {
+                    // The renderer protocol is newline-delimited JSON; non-JSON stdout is ignored.
+                  }
+                }
+              })
+              child.stderr?.on('data', (chunk: Buffer) => {
+                stderrTail = `${stderrTail}${chunk.toString('utf-8')}`.slice(-4000)
+              })
+              child.on('error', (error) => {
+                job.process = null
+                job.state = 'failed'
+                job.phase = 'failed'
+                job.error = error.message
+                job.updatedAt = Date.now()
+              })
+              child.on('close', (code) => {
+                job.process = null
+                job.updatedAt = Date.now()
+                if (code === 0 && !job.error && fs.existsSync(job.resultPath)) {
+                  job.state = 'completed'
+                  job.phase = 'completed'
+                  job.error = null
+                } else {
+                  job.state = 'failed'
+                  job.phase = 'failed'
+                  job.error = job.error || stderrTail.trim() || `share_export_renderer_exit_${code ?? 'unknown'}`
+                }
+              })
+
+              writeJson(res, 202, {
+                ...shareImageJobStatus(job),
+                reused: false,
+              })
+            } catch (error) {
+              const message = error instanceof Error ? error.message : 'snapshot_failed'
+              const status = message === 'history_not_found' ? 404 : 500
+              writeJson(res, status, { error: message })
+            }
+          })
+          return
+        }
+
+        const match = requestUrl.pathname.match(/^\/share-api\/jobs\/([a-f0-9]{32})(?:\/(snapshot|download))?$/)
+        if (!match || (req.method !== 'GET' && req.method !== 'HEAD')) {
+          writeJson(res, match ? 405 : 404, { error: match ? 'method_not_allowed' : 'job_not_found' })
+          return
+        }
+        const job = shareImageJobs.get(match[1])
+        if (!job) {
+          writeJson(res, 404, { error: 'job_not_found' })
+          return
+        }
+        const resource = match[2]
+        if (!resource) {
+          writeJson(res, 200, shareImageJobStatus(job))
+          return
+        }
+        const filePath = resource === 'snapshot' ? job.snapshotPath : job.resultPath
+        if (resource === 'download' && job.state !== 'completed') {
+          writeJson(res, 409, { error: 'job_not_completed' })
+          return
+        }
+        if (!fs.existsSync(filePath)) {
+          writeJson(res, 404, { error: 'job_file_not_found' })
+          return
+        }
+        const stat = fs.statSync(filePath)
+        res.statusCode = 200
+        res.setHeader(
+          'content-type',
+          resource === 'snapshot'
+            ? 'application/json; charset=utf-8'
+            : job.filename.toLowerCase().endsWith('.zip') ? 'application/zip' : 'image/png',
+        )
+        res.setHeader('content-length', String(stat.size))
+        res.setHeader('cache-control', 'no-store')
+        if (resource === 'download') {
+          res.setHeader('content-disposition', `attachment; filename="${job.filename}"`)
+        }
+        if (req.method === 'HEAD') {
+          res.end()
+          return
+        }
+        fs.createReadStream(filePath).pipe(res)
+      })
+
+      server.httpServer?.once('close', () => {
+        for (const job of shareImageJobs.values()) {
+          job.process?.kill('SIGTERM')
+          fs.rmSync(job.directory, { recursive: true, force: true })
+        }
+        shareImageJobs.clear()
+      })
+
       server.middlewares.use('/share-api/snapshot', (req, res) => {
         const writeJson = (statusCode: number, payload: unknown) => {
           res.statusCode = statusCode
@@ -865,6 +1200,88 @@ function devFileContentApi(): Plugin {
         }
       })
 
+      // 技能上传：接收 multipart 文件，保存到临时目录，返回文件路径
+      // 前端拿到路径后再通过 WebSocket 调用 skills.import_upload / skills.create_from_knowledge
+      server.middlewares.use('/file-api/skills/upload-temp', (req, res) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ error: 'method_not_allowed' }))
+          return
+        }
+
+        const contentType = req.headers['content-type'] || ''
+        const chunks: Buffer[] = []
+
+        req.on('data', (chunk: Buffer) => chunks.push(chunk))
+        req.on('end', () => {
+          try {
+            const body = Buffer.concat(chunks)
+            const tmpDir = path.join(os.tmpdir(), 'jiuwenswarm_skill_upload')
+            if (!fs.existsSync(tmpDir)) {
+              fs.mkdirSync(tmpDir, { recursive: true })
+            }
+
+            let fileBuffer: Buffer | null = null
+            let filename = 'upload.zip'
+
+            if (contentType.includes('multipart/form-data')) {
+              const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/)
+              if (boundaryMatch) {
+                const boundary = boundaryMatch[1] || boundaryMatch[2]
+                const boundaryBuf = Buffer.from(`--${boundary}`)
+                const parts: Buffer[] = []
+                let start = body.indexOf(boundaryBuf) + boundaryBuf.length
+
+                while (start < body.length) {
+                  const nextBoundary = body.indexOf(boundaryBuf, start)
+                  if (nextBoundary === -1) break
+                  parts.push(body.slice(start, nextBoundary))
+                  start = nextBoundary + boundaryBuf.length
+                }
+
+                for (const part of parts) {
+                  const headerEnd = part.indexOf('\r\n\r\n')
+                  if (headerEnd === -1) continue
+                  const header = part.slice(0, headerEnd).toString('utf-8')
+                  const content = part.slice(headerEnd + 4, part.length - 2)
+                  const nameMatch = header.match(/name="([^"]+)"/)
+                  const filenameMatch = header.match(/filename="([^"]+)"/)
+                  if (nameMatch && nameMatch[1] === 'file') {
+                    fileBuffer = content
+                    if (filenameMatch) filename = filenameMatch[1]
+                  }
+                }
+              }
+            } else {
+              fileBuffer = body
+              const url = new URL(req.url || '/file-api/skills/upload-temp', 'http://localhost')
+              const nameParam = url.searchParams.get('filename')
+              if (nameParam) filename = nameParam
+            }
+
+            if (!fileBuffer) {
+              res.statusCode = 400
+              res.setHeader('content-type', 'application/json; charset=utf-8')
+              res.end(JSON.stringify({ error: 'no_file_found' }))
+              return
+            }
+
+            const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_')
+            const tempPath = path.join(tmpDir, `${Date.now()}_${safeName}`)
+            fs.writeFileSync(tempPath, fileBuffer)
+
+            res.statusCode = 200
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.end(JSON.stringify({ path: tempPath }))
+          } catch (error) {
+            res.statusCode = 500
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.end(JSON.stringify({ error: (error as Error).message }))
+          }
+        })
+      })
+
       server.middlewares.use('/file-api/file-content', (req, res) => {
         if (req.method === 'GET') {
           const url = new URL(req.url || '/file-api/file-content', 'http://localhost')
@@ -1008,27 +1425,48 @@ function portFromEnv(name: string, fallback: number): number {
 const frontendPort = portFromEnv('FRONTEND_PORT', 5173)
 const webPort = portFromEnv('WEB_PORT', 19000)
 const webTarget = `http://127.0.0.1:${webPort}`
+// In Vite development, reuse the Python OAuth receiver instead of maintaining
+// a second in-memory handoff implementation.
+const hubOAuthBroker = process.env.JIUWENSWARM_HUB_OAUTH_BROKER_URL
+
+const isElectronBuild = process.env.ELECTRON === 'true'
 
 export default defineConfig({
+  base: isElectronBuild ? './' : '/',
   plugins: [suppressWsProxySocketErrors(), devWsTrafficLogger(), devFileContentApi(), react(), svgr()],
   optimizeDeps: {
     include: ['exceljs', 'jszip', 'saxes', 'ssf'],
   },
   resolve: {
+    dedupe: ['react', 'react-dom'],
     alias: {
       '@': path.resolve(__dirname, './src'),
+      'lucide-react': path.resolve(__dirname, './node_modules/lucide-react'),
+      react: path.resolve(__dirname, './node_modules/react'),
+      'react-dom': path.resolve(__dirname, './node_modules/react-dom'),
     },
   },
   server: {
+    host: true,
+    allowedHosts: ['127.0.0.1'],
     port: frontendPort,
     strictPort: true,
     proxy: {
+      ...(hubOAuthBroker ? {
+        '/marketplace-oauth/hub': { target: hubOAuthBroker },
+        '/oauth/hub': { target: hubOAuthBroker },
+      } : {}),
       '/api': {
         target: webTarget,
         changeOrigin: true,
       },
+      '/skillhub-api': {
+        target: 'http://119.8.233.112:8080',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/skillhub-api/, '/api/v1'),
+      },
       '/ws': {
-        target: webTarget,
+        target: webTarget, 
         ws: true,
         changeOrigin: true,
         configure: (proxy) => {

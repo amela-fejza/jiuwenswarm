@@ -44,6 +44,24 @@ def make_large_tool_result_records(count: int = 20) -> list[dict]:
     ]
 
 
+def test_subagent_activity_history_record_is_restorable():
+    assert agent_ws_server_module._is_restorable_history_record(
+        {
+            "id": "subagent-activity-1",
+            "role": "assistant",
+            "event_type": "chat.subagent_activity",
+            "content": "thinking",
+            "subagent_activity": {
+                "subagent_id": "sub-a",
+                "task_id": "turn-1",
+                "seq": 1,
+                "kind": "thinking",
+                "summary": "thinking",
+            },
+        }
+    ) is True
+
+
 @pytest.fixture(autouse=True)
 def patch_wire_encoder(monkeypatch):
     monkeypatch.setattr(
@@ -136,6 +154,10 @@ async def test_team_history_get_cursor_continues_next_page(monkeypatch):
 
 
 def test_history_get_sanitizes_large_restorable_records(monkeypatch):
+    """chat.tool_result 不在切片白名单里：仍要走 string-truncate 才发到 wire。
+    新逻辑下 sanitize 不在 get_conversation_history 里做（移到 split_history_record_for_stream
+    里），所以这里直接调 split_history_record_for_stream 验最终 wire record 有界、
+    content 被截断。"""
     large_record = {
         "id": "tool-result-large",
         "role": "assistant",
@@ -147,20 +169,32 @@ def test_history_get_sanitizes_large_restorable_records(monkeypatch):
         },
     }
 
-    monkeypatch.setattr(agent_ws_server_module, "history_exists", lambda session_id: True)
+    monkeypatch.setattr(agent_ws_server_module, "history_exists", lambda session_id, **_kwargs: True)
     monkeypatch.setattr(
         agent_ws_server_module,
         "load_history_records",
-        lambda session_id: [large_record],
+        lambda session_id, **_kwargs: [large_record],
     )
 
+    # get_conversation_history 现在返回 raw record（不在内部 sanitize）——
+    # sanitize 移到 _handle_history_get_stream 里调 split 时做。这里先验 raw 透传。
     result = agent_ws_server_module.AgentWebSocketServer.get_conversation_history(
         "sess-large",
         1,
     )
 
     assert result is not None
-    message = result["messages"][0]
+    raw_message = result["messages"][0]
+    # raw 状态——还没被 string-truncate
+    assert raw_message["content"] == "x" * 100_000
+
+    # 真正的 sanitize 在 split_history_record_for_stream 里：chat.tool_result 仍单帧，
+    # content 字符串被截断到 16KB + [truncated]。
+    from jiuwenswarm.server.wire_truncate import split_history_record_for_stream
+
+    chunks = split_history_record_for_stream(raw_message)
+    assert len(chunks) == 1
+    message = chunks[0]
     assert message["content"].endswith("[truncated]")
     assert message["tool_result"]["result"].endswith("[truncated]")
     from jiuwenswarm.server import wire_truncate as wire_truncate_module
@@ -169,6 +203,43 @@ def test_history_get_sanitizes_large_restorable_records(monkeypatch):
         len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
         <= getattr(wire_truncate_module, "_HISTORY_WIRE_RECORD_MAX_BYTES")
     )
+
+
+def test_side_history_hides_inherited_parent_records(monkeypatch):
+    inherited = {
+        "id": "parent-user",
+        "role": "user",
+        "content": "parent question",
+        "forked_from": {"session_id": "parent"},
+    }
+    side_message = {
+        "id": "side-user",
+        "role": "user",
+        "content": "side question",
+    }
+    monkeypatch.setattr(agent_ws_server_module, "history_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_ws_server_module,
+        "load_history_records",
+        lambda *_args, **_kwargs: [inherited, side_message],
+    )
+    monkeypatch.setattr(
+        agent_ws_server_module,
+        "get_session_metadata",
+        lambda *_args, **_kwargs: {
+            "ephemeral": True,
+            "side_parent_session_id": "parent",
+        },
+        raising=False,
+    )
+
+    result = agent_ws_server_module.AgentWebSocketServer.get_conversation_history(
+        "side",
+        1,
+    )
+
+    assert result is not None
+    assert result["messages"] == [side_message]
 
 
 @pytest.mark.asyncio

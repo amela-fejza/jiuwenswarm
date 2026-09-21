@@ -19,7 +19,10 @@ functions, hence this hook.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+import pytest
 
 import jiuwenswarm.common.utils as _utils
 
@@ -36,6 +39,37 @@ _EXTERNAL_MEMORY_BASENAMES = frozenset(
         "test_external_memory_config.py",
     }
 )
+
+
+@pytest.fixture
+def internal_auto_mode(monkeypatch):
+    """Opt in retained Smart internals; product-entry tests keep real mode support."""
+    from jiuwenswarm.agents.harness.common.rails.permissions import auto_config
+
+    monkeypatch.setattr(
+        auto_config, "_VALID_RUNTIME_MODES",
+        auto_config._VALID_RUNTIME_MODES | {auto_config.AUTO_PERMISSION_MODE},
+    )
+
+
+@pytest.fixture
+def allow_macos_pytest_temp_sources(monkeypatch):
+    """让使用 /private/var 临时目录的测试显式绕过内置 /var 黑名单。"""
+    if sys.platform != "darwin":
+        return
+
+    from jiuwenswarm.server.runtime.skill.skill_manager import SkillManager
+
+    get_roots = SkillManager._get_import_local_forbidden_roots
+
+    def _get_test_forbidden_roots() -> list[Path]:
+        return [root for root in get_roots() if root != Path("/var")]
+
+    monkeypatch.setattr(
+        SkillManager,
+        "_get_import_local_forbidden_roots",
+        staticmethod(_get_test_forbidden_roots),
+    )
 
 
 def _stub_get_config_file() -> Path:

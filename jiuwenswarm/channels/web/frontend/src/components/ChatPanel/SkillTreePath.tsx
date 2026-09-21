@@ -15,6 +15,7 @@ import type {
 } from '../../types/skillTree';
 import './SkillTreePath.css';
 import { useProcessTreeCollapse } from './useProcessTreeCollapse';
+import { useTimelineRowState } from './timelineRowState';
 
 interface SkillTreePathProps {
   tree?: SkillTreePathData;
@@ -373,8 +374,10 @@ function BrowseNodeView({
     : '暂无展开子项';
 
   return (
-    <div className="skill-path-tree__row" style={{ paddingLeft: `${Math.min(node.depth, 6) * 14}px` }}>
+    <div className="skill-path-tree__row" style={{ paddingLeft: `${Math.min(node.depth, 6) * 14}px` }} data-testid="chat-panel-skill-tree-node-row" data-variant={node.id}>
       <div
+        data-testid="chat-panel-skill-tree-node"
+        data-variant={node.kind}
         className={clsx(
           'skill-path-tree__node',
           `skill-path-tree__node--${node.kind}`,
@@ -385,20 +388,20 @@ function BrowseNodeView({
         )}
         title={nodeTitle(node)}
       >
-        <div className="skill-path-tree__node-main">
-          <span className="skill-path-tree__type">
+        <div className="skill-path-tree__node-main" data-testid="chat-panel-skill-tree-node-main">
+          <span className="skill-path-tree__type" data-testid="chat-panel-skill-tree-node-type">
             {node.kind === 'skill' ? '技能' : '分支'}
           </span>
-          <span className="skill-path-tree__label">{node.label}</span>
-          <span className="skill-path-tree__state">
+          <span className="skill-path-tree__label" data-testid="chat-panel-skill-tree-node-label">{node.label}</span>
+          <span className="skill-path-tree__state" data-testid="chat-panel-skill-tree-node-state">
             {isViewedSkill ? '已查看' : nodeStateLabel(node)}
           </span>
         </div>
-        {nodeMeta && <div className="skill-path-tree__meta">{nodeMeta}</div>}
+        {nodeMeta && <div className="skill-path-tree__meta" data-testid="chat-panel-skill-tree-node-meta">{nodeMeta}</div>}
       </div>
 
       {hasChildren && (
-        <div className="skill-path-tree__children">
+        <div className="skill-path-tree__children" data-testid="chat-panel-skill-tree-children">
           {visibleChildren.map((child) => (
             <BrowseNodeView
               key={child.id}
@@ -415,6 +418,8 @@ function BrowseNodeView({
               type="button"
               className="skill-path-tree__more"
               onClick={() => onToggleExpanded(node.id)}
+              data-testid="chat-panel-skill-tree-more"
+              data-variant="expand"
             >
               展开其余 {hiddenChildCount} 项
             </button>
@@ -424,6 +429,8 @@ function BrowseNodeView({
               type="button"
               className="skill-path-tree__more"
               onClick={() => onToggleExpanded(node.id)}
+              data-testid="chat-panel-skill-tree-more"
+              data-variant="collapse"
             >
               收起部分子项
             </button>
@@ -451,9 +458,10 @@ export function SkillTreePath({
   );
   const [collapsed, setCollapsed] = useProcessTreeCollapse(
     autoCollapse,
-    graph.queryLabel
+    graph.queryLabel,
+    'skill-tree-collapsed',
   );
-  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set());
+  const [expandedNodeIds, setExpandedNodeIds] = useTimelineRowState<Set<string>>('skill-expanded-nodes', () => new Set());
   const [newNodeIds, setNewNodeIds] = useState<Set<string>>(() => new Set());
   const previousNodeIdsRef = useRef<Set<string> | null>(null);
 
@@ -506,26 +514,27 @@ export function SkillTreePath({
   }
 
   return (
-    <div className="skill-path animate-rise" data-testid="skill-tree-path">
+    <div className="skill-path animate-rise" data-testid="chat-panel-skill-tree-path">
       <button
         type="button"
         className="skill-path__header"
+        data-testid="chat-panel-skill-tree-path-header"
         onClick={() => setCollapsed((value) => !value)}
         aria-expanded={!collapsed}
       >
-        <span className="skill-path__title">
-          <span className="skill-path__badge">技能检索树</span>
+        <span className="skill-path__title" data-testid="chat-panel-skill-tree-path-title">
+          <span className="skill-path__badge" data-testid="chat-panel-skill-tree-path-badge">技能检索树</span>
           {graph.queryLabel && (
-            <span className="skill-path__query" title={graph.queryLabel}>
+            <span className="skill-path__query" title={graph.queryLabel} data-testid="chat-panel-skill-tree-path-query">
               {graph.queryLabel}
             </span>
           )}
         </span>
-        <span className="skill-path__meta">
-          <span>{graph.exploreCount} 次展开</span>
-          <span>{graph.peekCount} 次窥探</span>
-          <span>{graph.exposedSkillCount} 个披露技能</span>
-          {graph.foldedBranchCount > 0 && <span>{graph.foldedBranchCount} 个分支折叠</span>}
+        <span className="skill-path__meta" data-testid="chat-panel-skill-tree-path-meta">
+          <span data-testid="chat-panel-skill-tree-path-stat" data-variant="explore">{graph.exploreCount} 次展开</span>
+          <span data-testid="chat-panel-skill-tree-path-stat" data-variant="peek">{graph.peekCount} 次窥探</span>
+          <span data-testid="chat-panel-skill-tree-path-stat" data-variant="exposed">{graph.exposedSkillCount} 个披露技能</span>
+          {graph.foldedBranchCount > 0 && <span data-testid="chat-panel-skill-tree-path-stat" data-variant="folded">{graph.foldedBranchCount} 个分支折叠</span>}
           <span className={clsx('skill-path__chevron', !collapsed && 'is-open')} aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8">
               <path strokeLinecap="round" strokeLinejoin="round" d="m6.5 8 3.5 4 3.5-4" />
@@ -535,10 +544,10 @@ export function SkillTreePath({
       </button>
 
       {!collapsed && (
-        <div className="skill-path__body-wrap">
+        <div className="skill-path__body-wrap" data-testid="chat-panel-skill-tree-path-body">
           <div className="skill-path-tree">
-            <div className="skill-path-tree__canvas">
-              <div className="skill-path-tree__forest">
+            <div className="skill-path-tree__canvas" data-testid="chat-panel-skill-tree-canvas">
+              <div className="skill-path-tree__forest" data-testid="chat-panel-skill-tree-forest">
                 {graph.rootIds.map((rootId) => (
                   <BrowseNodeView
                     key={rootId}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from jiuwenswarm.common.config import get_config
 from jiuwenswarm.extensions.agentos.agentos_router.agent_manager import AgentManager
+from jiuwenswarm.extensions.agentos.agentos_router.agentos_authenticator import AgentOSAuthenticator
 from jiuwenswarm.extensions.agentos.agentos_router.config import (
     RouterConfig,
     agentos_router_selected,
@@ -36,6 +37,9 @@ class AgentOSRouter(AgentServerClientExtension, ThirdAgentExtension):
             invoke_timeout_s=config.invoke_timeout_s,
             agent_timeout_s=config.agent_timeout_s,
             agent_namespace=config.agent_namespace,
+            probe_settings=config.probes,
+            wait_running_timeout_s=config.probes.wait_running_timeout_seconds,
+            wait_running_interval_s=config.probes.wait_running_interval_seconds,
         )
         self._registry_client = RegistryClient(config.registry)
         self._agent_manager = AgentManager(
@@ -57,6 +61,12 @@ class AgentOSRouter(AgentServerClientExtension, ThirdAgentExtension):
             sandbox_idle_check_interval_seconds=(
                 config.sandbox_idle_check_interval_seconds
             ),
+            disconnect_cleanup_timeout_seconds=(
+                config.disconnect_cleanup_timeout_seconds
+            ),
+            connect_warmup_enabled=config.connect_warmup_enabled,
+            probe_settings=config.probes,
+            auth_client=AgentOSAuthenticator(config.auth_service_url, config.timeout) if config.auth_enabled else None
         )
         self._third_agent = AgentOSThirdAgent(self._router_client)
         self._closed = False
@@ -69,6 +79,18 @@ class AgentOSRouter(AgentServerClientExtension, ThirdAgentExtension):
 
     def get_third_agent(self) -> ThirdAgent:
         return self._third_agent
+
+    def set_key_issuer(
+        self,
+        key_issuer,
+        *,
+        ephemeral_key_ttl_sec: float = 300.0,
+    ) -> None:
+        """Inject AgentOS SSH key issuer (or clear)."""
+        self._router_client.set_key_issuer(
+            key_issuer,
+            ephemeral_key_ttl_sec=ephemeral_key_ttl_sec,
+        )
 
     async def shutdown(self) -> None:
         if self._closed:
