@@ -927,8 +927,8 @@ export const MessageItem = memo(function MessageItem({
                   {...tooltipHandlers}
                   onClick={handleCopy}
                   className={clsx(
-                    'p-1.5 rounded-md',
-                    copied ? 'text-accent' : 'hover:text-accent hover:bg-secondary'
+                    'px-1 py-1.5 rounded-md',
+                    copied ? 'text-accent' : 'hover:bg-secondary'
                   )}
                 >
                   {copied ? (
@@ -950,10 +950,10 @@ export const MessageItem = memo(function MessageItem({
                   {...tooltipHandlers}
                   onClick={handleSpeak}
                   className={clsx(
-                    'p-1.5 rounded-md ',
+                    'px-1 py-1.5 rounded-md ',
                     isPlaying
                       ? 'text-accent bg-accent/10'
-                      : 'hover:text-accent hover:bg-secondary'
+                      : 'hover:bg-secondary'
                   )}
                 >
                   {isPlaying ? (
@@ -977,7 +977,7 @@ export const MessageItem = memo(function MessageItem({
                   onClick={() => void handleForkFromMessage()}
                   disabled={isForking}
                   className={clsx(
-                    'p-1.5 rounded-md hover:text-accent hover:bg-secondary',
+                    'px-1 py-1.5 rounded-md hover:bg-secondary',
                     isForking && 'cursor-wait opacity-50'
                   )}
                 >
