@@ -2334,6 +2334,9 @@ function registerIpcHandlers() {
     const paths = await clipboardFilePaths();
     return describeLocalPaths(paths);
   });
+  registerHandler('desktop:paste-clipboard', () => {
+    mainWindow.webContents.paste();
+  });
   registerHandler('desktop:save-data-url', async (dataUrl, filename) => {
     if (typeof dataUrl !== 'string' || !dataUrl.startsWith(PNG_DATA_URL_PREFIX)) {
       return { ok: false, cancelled: false };
@@ -2729,6 +2732,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     // 共享浏览器 partition 的 permission handler 在 ensureBrowserView 内按需注册。
     // 先读回上次运行保存的会话页面 URL（重启还原），再进入启动流程。
+    Menu.setApplicationMenu(null);
     loadSessionLastUrls();
     if (cdpPortPending) {
       cdpPortResolution = resolveCdpPortFromDevToolsActivePort();

@@ -25,6 +25,7 @@ import {
   MediaItem,
 } from '../types';
 import { useTodoStore } from './todoStore';
+import { findActiveTeamLeaderMessage } from '../features/teamLeaderMessages';
 import {
   mergeReviewerProgress,
   mergeToolResultProgress,
@@ -87,6 +88,18 @@ interface TaskItem {
   error?: string;
   /** Persisted attachments (images/documents, incl. PDF); dispatched with the message when the queued task is sent */
   mediaItems?: MediaItem[];
+}
+
+export interface QueuedSessionMessage {
+  messageId: string;
+  sourceSessionId: string;
+  sourceTitle: string;
+  content: string;
+}
+
+export interface QueuedSessionMessageSnapshot {
+  generation: number;
+  previous: QueuedSessionMessage[];
 }
 
 export interface HistoryPagerMeta {
@@ -159,6 +172,10 @@ export interface ChatRuntime {
     toolResultDedupDropped: number;
   };
   taskQueue: TaskItem[];
+  queuedSessionMessages: QueuedSessionMessage[];
+  queuedSessionMessageSnapshotGeneration: number;
+  /** A mailbox item cannot return to queued after it starts. */
+  settledQueuedSessionMessageIds: Set<string>;
   /** Keep request ownership even after a receipt is dismissed, to isolate late ACK/errors. */
   taskInputRequests: Record<string, { taskId: string; content: string; delivery?: 'chat' }>;
   /** Message-level feedback survives removal from the executable queue. */
@@ -212,6 +229,9 @@ function createEmptyRuntime(): ChatRuntime {
       toolResultDedupDropped: 0,
     },
     taskQueue: [],
+    queuedSessionMessages: [],
+    queuedSessionMessageSnapshotGeneration: 0,
+    settledQueuedSessionMessageIds: new Set(),
     taskInputRequests: {},
     taskInputReceipts: {},
     queuePaused: false,
@@ -280,7 +300,7 @@ interface ChatState {
   startStreaming: (sessionId: string, messageId: string, streamKey?: string) => void;
   stopStreaming: (sessionId: string, streamKey?: string) => void;
   finalizeStreamSegment: (sessionId: string, streamKey?: string) => void;
-  finalizeTeamLeaderSegment: (sessionId: string) => void;
+  finalizeTeamLeaderSegment: (sessionId: string, requestId?: string) => void;
   clearStreamSplit: (sessionId: string) => void;
   collapseTurnFinal: (
     sessionId: string,
@@ -303,6 +323,14 @@ interface ChatState {
   setEvolutionStatus: (sessionId: string, status: EvolutionStatusPayload | null) => void;
   setPaused: (sessionId: string, paused: boolean, task?: string | null) => void;
   setQueuePaused: (sessionId: string, paused: boolean) => void;
+  upsertQueuedSessionMessage: (sessionId: string, message: QueuedSessionMessage) => void;
+  removeQueuedSessionMessage: (sessionId: string, messageId: string) => void;
+  beginQueuedSessionMessageSnapshot: (sessionId: string) => QueuedSessionMessageSnapshot;
+  reconcileQueuedSessionMessageSnapshot: (
+    sessionId: string,
+    snapshot: QueuedSessionMessageSnapshot,
+    messages: QueuedSessionMessage[]
+  ) => void;
   setInterruptResult: (sessionId: string, result: InterruptResultPayload | null) => void;
   setSwitchingMode: (sessionId: string, switching: boolean) => void;
   setNewSession: (sessionId: string, isNew: boolean) => void;
@@ -483,7 +511,10 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
               toolResultDedupDropped: 0,
             },
             taskQueue: [],
-            pendingQuestions: [],
+            // pendingQuestions 是后端通过 chat.ask_user_question 实时推送的交互状态，
+            // 不属于历史消息范畴。历史恢复只重建消息列表，不应清空 pendingQuestions——
+            // 否则切到/切回一个正在等待 ask_user/权限确认的会话时，吸附条会永久消失
+            // （后端不会重发 pending question）。仅在新会话首次创建时由 clearMessages 清空。
             pendingGoalObjectiveBubble: null,
           },
         },
@@ -740,26 +771,12 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
     });
   },
 
-  finalizeTeamLeaderSegment: (sessionId) => {
+  finalizeTeamLeaderSegment: (sessionId, requestId) => {
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
-      let latestUserIndex = -1;
-      for (let i = runtime.messages.length - 1; i >= 0; i -= 1) {
-        if (runtime.messages[i].role === 'user') {
-          latestUserIndex = i;
-          break;
-        }
-      }
-      let target: Message | undefined;
-      for (let i = runtime.messages.length - 1; i > latestUserIndex; i -= 1) {
-        const msg = runtime.messages[i];
-        if (msg.id.startsWith('team-leader-') && msg.isStreaming) {
-          target = msg;
-          break;
-        }
-      }
-      if (!target || !target.content?.trim()) return state;
+      const target = findActiveTeamLeaderMessage(runtime.messages, requestId);
+      if (!target) return state;
       const targetId = target.id;
       return {
         runtimes: {
@@ -767,7 +784,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
           [sessionId]: {
             ...runtime,
             messages: runtime.messages.map((msg) =>
-              msg.id === targetId ? { ...msg, isStreaming: false } : msg
+              msg.id === targetId ? { ...msg, isStreaming: false, teamStream: undefined } : msg
             ),
             assistantStreamSplit: true,
           },
@@ -1040,6 +1057,84 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
         runtimes: {
           ...state.runtimes,
           [sessionId]: { ...runtime, queuePaused: paused },
+        },
+      };
+    });
+  },
+
+  upsertQueuedSessionMessage: (sessionId, message) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId] ?? createEmptyRuntime();
+      if (runtime.settledQueuedSessionMessageIds.has(message.messageId)) return state;
+      const existing = runtime.queuedSessionMessages.findIndex(
+        (item) => item.messageId === message.messageId
+      );
+      const queuedSessionMessages = [...runtime.queuedSessionMessages];
+      if (existing >= 0) queuedSessionMessages[existing] = message;
+      else queuedSessionMessages.push(message);
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, queuedSessionMessages },
+        },
+      };
+    });
+  },
+
+  removeQueuedSessionMessage: (sessionId, messageId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId] ?? createEmptyRuntime();
+      if (runtime.settledQueuedSessionMessageIds.has(messageId)) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            queuedSessionMessages: runtime.queuedSessionMessages.filter(
+              (item) => item.messageId !== messageId
+            ),
+            settledQueuedSessionMessageIds: new Set([...runtime.settledQueuedSessionMessageIds, messageId]),
+          },
+        },
+      };
+    });
+  },
+
+  beginQueuedSessionMessageSnapshot: (sessionId) => {
+    const runtime = get().ensureRuntime(sessionId);
+    const snapshot = {
+      generation: runtime.queuedSessionMessageSnapshotGeneration + 1,
+      previous: runtime.queuedSessionMessages,
+    };
+    set((state) => ({
+      runtimes: {
+        ...state.runtimes,
+        [sessionId]: {
+          ...state.runtimes[sessionId],
+          queuedSessionMessageSnapshotGeneration: snapshot.generation,
+        },
+      },
+    }));
+    return snapshot;
+  },
+
+  reconcileQueuedSessionMessageSnapshot: (sessionId, snapshot, messages) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime || runtime.queuedSessionMessageSnapshotGeneration !== snapshot.generation) return state;
+      const queuedSessionMessages = messages.filter(
+        (message) => !runtime.settledQueuedSessionMessageIds.has(message.messageId)
+      );
+      for (const message of runtime.queuedSessionMessages) {
+        if (snapshot.previous.includes(message)) continue;
+        const existing = queuedSessionMessages.findIndex((item) => item.messageId === message.messageId);
+        if (existing >= 0) queuedSessionMessages[existing] = message;
+        else queuedSessionMessages.push(message);
+      }
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, queuedSessionMessages },
         },
       };
     });

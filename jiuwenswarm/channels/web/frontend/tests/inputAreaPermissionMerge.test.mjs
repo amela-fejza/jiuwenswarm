@@ -5,8 +5,51 @@ import { createRoot } from 'react-dom/client';
 import { I18nextProvider } from 'react-i18next';
 import { JSDOM } from 'jsdom';
 
-// Reserved, non-resolving DOM origin only; fetch and WebSocket below reject all network access.
+// Reserved, non-resolving DOM origin only; fetch rejects network access and the WebSocket fixture returns picker data.
 const dom = new JSDOM('<div id="root"></div>', { url: 'https://input-area.invalid', pretendToBeVisual: true });
+class MockWebSocket {
+  static OPEN = 1;
+  static CLOSED = 3;
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    queueMicrotask(() => {
+      this.readyState = MockWebSocket.OPEN;
+      this.onopen?.();
+    });
+  }
+
+  send(rawMessage) {
+    const request = JSON.parse(rawMessage);
+    if (request.method !== 'agent_groups.list') {
+      throw new Error(`Unexpected WebSocket request: ${request.method}`);
+    }
+    const payload = {
+      agentGroups: [
+        {
+          id: 'group-1',
+          name: 'group-1',
+          displayName: '可选专家团',
+          installed: true,
+          source: 'local',
+          capabilities: { canUse: true },
+        },
+      ],
+    };
+    queueMicrotask(() => {
+      this.onmessage?.({
+        data: JSON.stringify({ type: 'res', id: request.id, ok: true, payload }),
+      });
+    });
+  }
+
+  close() {
+    this.readyState = MockWebSocket.CLOSED;
+    this.onclose?.({ code: 1000, reason: 'test', wasClean: true });
+  }
+}
+
 const globals = {
   window: dom.window,
   document: dom.window.document,
@@ -16,6 +59,7 @@ const globals = {
   HTMLElement: dom.window.HTMLElement,
   MutationObserver: dom.window.MutationObserver,
   CustomEvent: dom.window.CustomEvent,
+  FileReader: dom.window.FileReader,
   getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
   requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
   cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
@@ -28,11 +72,7 @@ const globals = {
   fetch: () => {
     throw new Error('InputArea permission interactions must not perform HTTP requests');
   },
-  WebSocket: class {
-    constructor() {
-      throw new Error('Unexpected WebSocket connection');
-    }
-  },
+  WebSocket: MockWebSocket,
 };
 const descriptors = new Map(Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
 for (const [key, value] of Object.entries(globals)) {
@@ -100,8 +140,16 @@ test('idle composer still submits normally', async () => {
   });
 });
 
-async function mount({ mode = 'agent', profile = 'default', language = 'en' } = {}, run) {
-  const sessionId = 'input-permission-merge';
+const flushMicrotasks = async () =>
+  act(async () => {
+    for (let index = 0; index < 4; index += 1) await Promise.resolve();
+  });
+
+async function mount(
+  { mode = 'agent', profile = 'default', language = 'en', sessionId = 'input-permission-merge' } = {},
+  run,
+) {
+  useChatStore.getState().ensureRuntime(sessionId);
   useSessionStore.getState().ensureRuntime(sessionId);
   useSessionStore.getState().setMode(sessionId, mode);
   useChatStore.getState().ensureRuntime(sessionId);
@@ -231,6 +279,32 @@ test('team hides the permission selector without overwriting the persisted profi
   });
 });
 
+test('team skills and Expert Teams are mutually exclusive', async () => {
+  await mount({ mode: 'team', sessionId: 'new' }, async ({ sessionId }) => {
+    await act(async () => useSessionStore.getState().addSelectedSkill(sessionId, 'team-skill-1'));
+    await click(byId('chat-panel-input-attach-trigger'));
+    await click(byId('chat-panel-input-attach-menu-agent'));
+    await flushMicrotasks();
+
+    const groupItem = byId('chat-panel-agent-group-picker-item', 'group-1');
+    assert.equal(groupItem.getAttribute('aria-disabled'), 'true');
+    assert.equal(groupItem.classList.contains('is-locked'), true);
+    assert.equal(groupItem.getAttribute('data-tooltip'), i18n.t('chat.teamSkillsGroupLocked'));
+
+    await click(groupItem);
+    assert.deepEqual(useSessionStore.getState().runtimes[sessionId].agentGroupSelectionIntent, { kind: 'keep' });
+
+    await act(async () => useSessionStore.getState().removeSelectedSkill(sessionId, 'team-skill-1'));
+    assert.equal(groupItem.getAttribute('aria-disabled'), 'false');
+
+    await act(async () =>
+      useSessionStore.getState().setAgentGroupSelectionIntent(sessionId, { kind: 'select', id: 'group-1' }),
+    );
+    await act(async () => useSessionStore.getState().addSelectedSkill(sessionId, 'team-skill-2'));
+    assert.deepEqual(useSessionStore.getState().runtimes[sessionId].selectedSkills, []);
+  });
+});
+
 test('default selection sends the profile contract and reflects the persisted prop', async () => {
   await mount({ profile: 'full_access' }, async ({ saved, props, render }) => {
     await click(byId('chat-panel-permission-selector-trigger'));
@@ -259,3 +333,31 @@ for (const action of ['cancel', 'confirm']) {
     });
   });
 }
+test('composer exposes Full-duplex only when idle with no text or attachments', async () => {
+  await mount({}, async ({ sessionId, props, render }) => {
+    props.onPersistDocuments = async (_content, items) => ({
+      media_items: items.map((item) => ({ ...item, path: '/workspace/note.txt' })),
+    });
+    await render();
+    assert.ok(byId('test-duplex-action'));
+    await act(async () => useChatStore.getState().setInputValue(sessionId, 'read this file'));
+    assert.equal(!!document.querySelector('[data-testid="test-duplex-action"]'), false, 'text hides voice action');
+    assert.ok(byId('chat-panel-input-send'));
+    await act(async () => useChatStore.getState().setInputValue(sessionId, ''));
+    assert.ok(byId('test-duplex-action'));
+    props.isProcessing = true;
+    await render();
+    assert.equal(!!document.querySelector('[data-testid="test-duplex-action"]'), false, 'processing hides voice action');
+    props.isProcessing = false;
+    await render();
+    const input = byId('chat-panel-input-file-input');
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: [new dom.window.File(['test'], 'note.txt', { type: 'text/plain' })],
+    });
+    await act(async () => input.dispatchEvent(new dom.window.Event('change', { bubbles: true })));
+    assert.ok(byId('chat-panel-input-attachment-card'));
+    assert.equal(!!document.querySelector('[data-testid="test-duplex-action"]'), false, 'attachment hides voice action');
+    assert.ok(byId('chat-panel-input-send'));
+  });
+});
