@@ -27,6 +27,7 @@ import {
   type FilePreviewTreeNode,
 } from '../ui';
 import { Switch } from '../Switch';
+import { resolveMarketplaceInstalledLocalName } from '../../utils/skillNetUrl';
 import { buildSkillVersionOptions } from './skillVersionOptions';
 import type {
   EvolutionEntry,
@@ -73,17 +74,11 @@ function PackMembersGrid({
   members,
   mode = 'hub',
   onOpenMember,
-  onInstallMember,
-  installingName,
 }: {
   members?: SkillPackMember[];
   /** installed：已安装模式，卡片可点击进成员详情；hub：未安装，只读 */
   mode?: 'hub' | 'installed';
   onOpenMember?: (name: string) => void;
-  /** 卸载成员的"安装"回调（从包内备份恢复） */
-  onInstallMember?: (name: string) => void;
-  /** 正在安装的成员名（loading 态） */
-  installingName?: string | null;
 }) {
   const { t } = useTranslation();
   // 成员为空时显示空态文案
@@ -103,23 +98,6 @@ function PackMembersGrid({
         const isBlocked = member.available === false;
         const reasonKey = member.blocking_reason ? MEMBER_BLOCKING_REASON_KEYS[member.blocking_reason] : undefined;
         const interactable = mode === 'installed' && !isBlocked;
-        const isRestorable = mode === 'installed' && isBlocked && member.restorable === true;
-        const isInstalling = installingName === member.name;
-        // 右上角操作区：已卸载成员显示「安装」按钮（从包内备份一键恢复）
-        const actionContent = isRestorable ? (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onInstallMember?.(member.name);
-            }}
-            disabled={isInstalling}
-            data-testid="skill-panel-pack-member-install-btn"
-            className="flex items-center gap-1 h-7 px-2.5 rounded-[14px] text-xs text-text-inverse bg-control-emphasis hover:opacity-80 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            {isInstalling ? t('common.loading') : t('skills.actions.install')}
-          </button>
-        ) : undefined;
         return (
           <PageCard
             key={member.path || member.name}
@@ -134,7 +112,6 @@ function PackMembersGrid({
             }
             description={member.description || t('skills.noDescription')}
             onClick={interactable ? () => onOpenMember?.(member.name) : undefined}
-            actionSlot={actionContent}
           />
         );
       })}
@@ -177,23 +154,22 @@ export interface InstalledSkillDetailViewProps extends SkillDetailCommonProps {
   rebuildLoading: boolean;
   onRebuild: (skillName: string, version: string | null) => void;
   setSynthesizeTooltip: (tooltip: { left: number; top: number } | null) => void;
-  onBackToList: () => void;
+  onBack: () => void;
   onEditSkill: (skillName: string, skillType?: string) => void;
   onUninstall: (pluginName: string) => void;
   onToggleSkillDisabled: (skillName: string) => void;
   onGoToChat: (skillName: string, skillType?: string) => void;
   /** "包含技能"成员：点击进成员详情 */
   onOpenPackMember: (memberName: string) => void;
-  /** "包含技能"成员：已卸载成员从包内备份安装恢复 */
-  onInstallPackMember: (memberName: string) => void;
-  /** 正在安装（恢复）的成员名 */
-  installingPackMemberName: string | null;
 }
 
 export interface HubSkillDetailViewProps extends SkillDetailCommonProps {
   mode: 'hub';
   hubSkill: MarketplacePluginItem;
   hubDetail: HubSkillDetail | null;
+  /** 本地技能列表：按 origin 判定广场条目是否已安装（SKILL.md name 可能 ≠ slug） */
+  localSkills: Array<{ name: string; origin?: string | null }>;
+  installedSkillNames: ReadonlySet<string>;
   /** 广场详情页签（内容详情 / 包含技能，仅技能包显示"包含技能"） */
   hubDetailTab: 'content' | 'members';
   setHubDetailTab: (tab: 'content' | 'members') => void;
@@ -208,7 +184,7 @@ export type SkillDetailViewProps = InstalledSkillDetailViewProps | HubSkillDetai
 export function SkillDetailView(props: SkillDetailViewProps) {
   const { t, i18n } = useTranslation();
   const tid = props.mode === 'installed' ? 'skill-panel-my-detail' : 'skill-panel-hub-detail';
-  const onBack = props.mode === 'installed' ? props.onBackToList : props.onBackToHubDetail;
+  const onBack = props.mode === 'installed' ? props.onBack : props.onBackToHubDetail;
 
   const renderShell = (
     header: { avatar: EntityHeaderAvatar; title: string; titleEnd?: ReactNode; tags?: string[] },
@@ -220,12 +196,12 @@ export function SkillDetailView(props: SkillDetailViewProps) {
     <>
       {props.detailState === 'loading' ? (
         /* 详情加载中：整区域状态视图（参考 agent-management），flex:1 填满详情区避免布局塌陷/抖动 */
-        <div data-testid={`${tid}-state`} data-variant="loading" className="skill-detail-state">
+        <div data-testid={`${tid}-state`} data-variant="loading" className="skill-detail-state detail-loading-shell">
           <button type="button" className="detail-back" onClick={onBack}>
             <BackIcon aria-hidden="true" />
             {t('agentManagement.actions.back')}
           </button>
-          <p>{t('common.loading')}</p>
+          <p className="detail-loading-center" data-testid={`${tid}-loading-text`}>{t('common.loading')}</p>
         </div>
       ) : (
         <div className="flex-1 flex flex-col min-h-0" data-testid={tid}>
@@ -276,8 +252,19 @@ export function SkillDetailView(props: SkillDetailViewProps) {
   );
 
   if (props.mode === 'hub') {
-    const { hubSkill, hubDetail, installedSkillMap, actionTarget, onInstallHubSkill, onGoToChat, hubDetailTab, setHubDetailTab } = props;
-    const isInstalled = installedSkillMap.has(hubSkill.name);
+    const {
+      hubSkill,
+      hubDetail,
+      localSkills,
+      installedSkillNames,
+      actionTarget,
+      onInstallHubSkill,
+      onGoToChat,
+      hubDetailTab,
+      setHubDetailTab,
+    } = props;
+    const localName = resolveMarketplaceInstalledLocalName(hubSkill, localSkills, installedSkillNames);
+    const isInstalled = Boolean(localName);
     const installing = actionTarget === `install:${hubSkill.identifier || hubSkill.asset_id}`;
     // 当前广场条目是否为技能包（用于显示"包含技能"页签）
     const isHubPackSkill = hubSkill.skill_type === 'skillpack' || hubSkill.plugin_type === 'skillpack';
@@ -292,9 +279,9 @@ export function SkillDetailView(props: SkillDetailViewProps) {
       },
       /* 下载/去试试按钮 */
       <div className="flex items-center gap-2 flex-shrink-0">
-        {isInstalled ? (
+        {isInstalled && localName ? (
           <button
-            onClick={() => onGoToChat(hubSkill.name, hubSkill.plugin_type === 'swarmskill' ? 'swarm_skill' : undefined)}
+            onClick={() => onGoToChat(localName, hubSkill.plugin_type === 'swarmskill' ? 'swarm_skill' : undefined)}
             className="flex items-center justify-center rounded-[16px] text-sm text-control-emphasis bg-card border border-control-emphasis hover:bg-secondary/30 whitespace-nowrap"
             style={{ height: '32px', padding: '0 24px' }}
             data-testid={`${tid}-go-try-btn`}
@@ -384,8 +371,6 @@ export function SkillDetailView(props: SkillDetailViewProps) {
     onToggleSkillDisabled,
     onGoToChat,
     onOpenPackMember,
-    onInstallPackMember,
-    installingPackMemberName,
   } = props;
   const skillDisplayName = selectedSkill.display_name || selectedSkill.name;
   const uninstallPluginName = installedSkillMap.get(selectedSkill.name)?.plugin_name || selectedSkill.name;
@@ -653,14 +638,12 @@ export function SkillDetailView(props: SkillDetailViewProps) {
           />
         )}
 
-        {/* 包含技能（技能包成员；已安装模式可点击进成员详情，卸载成员可安装恢复） */}
+        {/* 包含技能（技能包成员；已安装模式可点击进成员详情） */}
         {detailTab === 'members' && (
           <PackMembersGrid
             mode="installed"
             members={selectedSkill.skillpack?.members}
             onOpenMember={onOpenPackMember}
-            onInstallMember={onInstallPackMember}
-            installingName={installingPackMemberName}
           />
         )}
 
