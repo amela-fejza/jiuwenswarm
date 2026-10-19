@@ -211,6 +211,40 @@ async def test_hybrid_uncertain_escalates_to_llm(monkeypatch):
     assert "LLM" in decision.rationale or "agent" in decision.rationale.lower()
 
 
+@pytest.mark.asyncio
+async def test_hybrid_keeps_fallback_source_when_llm_fails(monkeypatch):
+    async def _fake_llm(query, *, gate, model_name=""):
+        from jiuwenswarm.agents.harness.macro_routing.schemas import MacroRoutingDecision
+
+        return MacroRoutingDecision(
+            mode=gate.mode,
+            confidence=gate.confidence,
+            rationale="LLM scheduler failed; using gate decision.",
+            source="fallback",
+            features=dict(gate.features),
+            gate_confident=False,
+        )
+
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.macro_routing.router.route_with_llm_scheduler",
+        _fake_llm,
+    )
+    decision = await route_macro_mode(
+        "What do you think about this overall?",
+        requested_mode="auto",
+        config_base={
+            "modes": {
+                "macro_routing": {
+                    "enabled": True,
+                    "strategy": "hybrid",
+                    "confidence_threshold": 0.72,
+                }
+            }
+        },
+    )
+    assert decision.source == "fallback"
+
+
 def test_load_macro_routing_config_defaults():
     cfg = load_macro_routing_config({"modes": {}})
     assert cfg["enabled"] is True

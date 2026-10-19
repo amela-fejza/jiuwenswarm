@@ -83,7 +83,9 @@ async def route_macro_mode(
         gate=gate,
         model_name=str(routing_cfg.get("model_name") or ""),
     )
-    decision.source = "hybrid"
+    # Keep "fallback" so a failed LLM call stays distinguishable from a real hybrid decision.
+    if decision.source != "fallback":
+        decision.source = "hybrid"
     logger.info(
         "[MacroRouter] hybrid escalated to LLM: gate=%s -> %s conf=%.2f",
         gate.mode,
