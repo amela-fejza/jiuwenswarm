@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { HelpCircle, CircleCheck, Clock3, CircleAlert, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import tipIcon from '../../assets/tip.svg';
 import { FormDrawer, Input, Textarea } from '../ui';
 import {
   beginHubOAuth,
@@ -12,7 +11,7 @@ import {
 } from '../../utils/gitcodeOAuth';
 import { PUBLISH_RESTORE_KEY, useAssetPublish } from '../../hooks/useAssetPublish';
 import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
-import { publishOutcome, validateMetadata, publishTimestamp } from '../../features/assetPublishState';
+import { publishOutcome, localRecordState, validateMetadata, publishTimestamp } from '../../features/assetPublishState';
 import { publishIssueKey } from '../../features/assetPublishErrors';
 import type { AssetPublishOpenRequest, AssetReference, PublishMetadata } from '../../types/assetPublish';
 import gitcodeIcon from '../../assets/settings/channels/gitcode.png';
@@ -93,11 +92,10 @@ const messages = {
     refresh: '刷新本地已知结果',
     queued: '已排队',
     uploading: '上传中',
-    pending_moderation: '提交成功，待审核',
-    published: '已发布',
     failed: '发布失败',
-    unknown: '结果待核实',
-    observed: '这里显示后端已知结果，不自动查询远端审核进度。',
+    submitted: '已提交',
+    unconfirmed: '提交结果未确认',
+    observed: '这里只显示本地可确定的提交状态；远端发布状态请以 Hub 为准。',
     requestFailed: '请求未完成，请重试或重新登录。',
     invalidPluginStructure: '资源包结构不符合 Hub 要求，请检查清单文件和目录结构。',
     pluginNotFound: 'Hub 中找不到要更新的资源，请检查“更新目标 Hub ID”后重试。',
@@ -105,6 +103,8 @@ const messages = {
     authRequired: '登录状态已失效，请重新登录。',
     resourceNotFound: '找不到本地资源，请确认资源仍然存在。',
     versionConflict: '该版本已提交过，请修改版本；确认需要覆盖时可在高级设置中开启覆盖。',
+    hubRequestFailed:
+      'Hub 未接受本次发布请求，可能是版本已存在或发布信息不符合 Hub 要求。请检查版本和发布信息后重试；如仍失败，请联系 Hub 管理员。',
     statusFailed: '任务查询暂时失败；后台任务仍可能运行，可刷新恢复。',
     commitUncertain: '提交响应未收到。请找回此次提交或刷新记录，不要创建新提交。',
     commitRejected: '后台拒绝了此次提交。请返回修改并重新检查。',
@@ -118,7 +118,6 @@ const messages = {
     unavailable: '此资源暂时无法发布，请查看检查原因。',
     empty: '无',
     draftExpiry: '检查结果有效期',
-    review: '请核对可见范围与内容，确认后由后台上传。',
     localSource: '本地资源',
     basicInfo: '基本信息',
     publishSettings: '发布设置',
@@ -180,11 +179,10 @@ const messages = {
     refresh: 'Refresh known local result',
     queued: 'Queued',
     uploading: 'Uploading',
-    pending_moderation: 'Submitted, pending moderation',
-    published: 'Published',
     failed: 'Publishing failed',
-    unknown: 'Result needs verification',
-    observed: 'This is the result known to the backend; remote moderation is not polled.',
+    submitted: 'Submitted',
+    unconfirmed: 'Submission result unconfirmed',
+    observed: 'Only locally confirmed submission states are shown here; check the Hub for remote publication status.',
     requestFailed: 'The request did not complete. Retry or sign in again.',
     invalidPluginStructure: 'The package structure does not meet Hub requirements. Check its manifest and folders.',
     pluginNotFound: 'The Hub resource to update was not found. Check the target Hub ID and retry.',
@@ -194,6 +192,8 @@ const messages = {
     resourceNotFound: 'The local resource was not found. Confirm that it still exists.',
     versionConflict:
       'This version was already submitted. Change it, or explicitly enable overwrite in advanced settings.',
+    hubRequestFailed:
+      'Hub did not accept this publishing request. The version may already exist, or the publishing information may not meet Hub requirements. Check the version and publishing information, then retry. If the problem continues, contact the Hub administrator.',
     statusFailed: 'Status is temporarily unavailable. The background task may still be running; refresh to recover.',
     commitUncertain:
       'No submission response was received. Recover this submission or refresh records before starting another.',
@@ -208,7 +208,6 @@ const messages = {
     unavailable: 'This resource cannot be published yet. Review the reasons below.',
     empty: 'None',
     draftExpiry: 'Review expires',
-    review: 'Check visibility and package contents. Confirming starts the backend upload.',
     localSource: 'Local resource',
     basicInfo: 'Basic information',
     publishSettings: 'Publishing settings',
@@ -379,10 +378,11 @@ function AssetPublishDrawer({
     tags: 'tagsHelp',
   };
   const outcome = state.record ? publishOutcome(state.record) : null;
+  const recordState = state.record ? localRecordState(state.record) : null;
   const ResultIcon =
-    outcome === 'failed'
+    recordState === 'failed'
       ? CircleAlert
-      : ['queued', 'uploading', 'unknown'].includes(outcome || '')
+      : ['queued', 'uploading', 'unconfirmed'].includes(recordState || '')
         ? Clock3
         : CircleCheck;
   const zh = i18n.language.startsWith('zh');
@@ -457,12 +457,6 @@ function AssetPublishDrawer({
       className="asset-publish-drawer"
       panelRef={panel}
       closeTestId="asset-publish-close"
-      notice={
-        <div className="asset-publish-notice" data-testid="asset-publish-notice">
-          <img src={tipIcon} alt="" aria-hidden="true" className="w-4 h-4" />
-          <span>{text('review')}</span>
-        </div>
-      }
       footer={
         <>
           {!review && !state.record && invalid && (
@@ -744,7 +738,6 @@ function AssetPublishDrawer({
           <p data-testid="asset-publish-review-visibility">
             {text('visibility')}: {text(state.metadata.visibility)}
           </p>
-          <p>{text('review')}</p>
           {state.draft && (
             <>
               <p data-testid="asset-publish-package-summary">
@@ -783,13 +776,13 @@ function AssetPublishDrawer({
           aria-live="polite"
           className="asset-publish-result-card"
           data-testid="asset-publish-result"
-          data-variant={outcome}
+          data-variant={recordState}
         >
           <header className="asset-publish-result-header" data-testid="asset-publish-result-header">
-            <span className="asset-publish-result-icon" aria-hidden="true">
+            <span className="asset-publish-result-icon" aria-hidden="true" data-testid="asset-publish-result-icon">
               <ResultIcon size={20} />
             </span>
-            <h3>{text(outcome as MessageKey)}</h3>
+            <h3 data-testid="asset-publish-result-status">{text(recordState as MessageKey)}</h3>
           </header>
           <dl className="asset-publish-result-metadata" data-testid="asset-publish-result-metadata">
             {state.record.result?.asset_id && (
@@ -868,8 +861,12 @@ function AssetPublishDrawer({
                   <strong>{record.result?.version || record.version || text('empty')}</strong>
                   {record.updated_at && <small>{dateText(record.updated_at)}</small>}
                 </span>
-                <span className="asset-publish-record-status" data-variant={publishOutcome(record)}>
-                  {text(publishOutcome(record) as MessageKey)}
+                <span
+                  className="asset-publish-record-status"
+                  data-testid="asset-publish-record-status"
+                  data-variant={localRecordState(record)}
+                >
+                  {text(localRecordState(record) as MessageKey)}
                 </span>
               </button>
             ))}

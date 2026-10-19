@@ -3,20 +3,21 @@ import { openAssetPublish } from '../../features/assetPublishEvents';
 import { canShowAssetPublish } from '../../features/assetPublishState';
 import type {
   AgentFileContent,
+  AgentGroupCatalogItem,
   AgentGroupDetail,
   DefinitionFileEntry,
   RequestStatus,
 } from '../../features/agentManagement';
-import { PublicationDetailStatus } from '../marketplace/PublicationDetailStatus';
 import { DefinitionFilePreview } from './DefinitionFilePreview';
 import { GroupAvatar } from './GroupCard';
 import BackIcon from '../../assets/work-mode/arrow-left.svg?react';
-import UninstallIcon from '../../assets/agent-management/uninstall.svg?react';
 import PromptSendIcon from '../../assets/agent-management/prompt-send.svg?react';
+import UninstallIcon from '../../assets/agent-management/uninstall.svg?react';
 import { DetailPromptChip, DetailSection, EntityAvatar, EntityHeader, MarkdownPane, PageToolbar, Tabs } from '../ui';
 
 type AgentGroupDetailPageProps = {
   detail: AgentGroupDetail | null;
+  loadingSummary: AgentGroupCatalogItem | null;
   detailStatus: RequestStatus;
   detailError: string | null;
   detailTab: 'content' | 'files';
@@ -27,7 +28,6 @@ type AgentGroupDetailPageProps = {
   fileContent: AgentFileContent | null;
   fileStatus: RequestStatus;
   fileError: string | null;
-  actionError: string | null;
   actionNotice: string | null;
   busy: boolean;
   onBack: () => void;
@@ -43,6 +43,7 @@ type AgentGroupDetailPageProps = {
 
 export function AgentGroupDetailPage({
   detail,
+  loadingSummary,
   detailStatus,
   detailError,
   detailTab,
@@ -53,7 +54,6 @@ export function AgentGroupDetailPage({
   fileContent,
   fileStatus,
   fileError,
-  actionError,
   actionNotice,
   busy,
   onBack,
@@ -69,16 +69,34 @@ export function AgentGroupDetailPage({
   const { t } = useTranslation();
   if (detailStatus === 'loading')
     return (
-      <div
-        className="agent-management-detail detail-loading-shell"
-        data-testid="agent-group-detail"
-        aria-busy="true"
-      >
+      <div className="agent-management-detail agent-group-detail" data-testid="agent-group-detail" aria-busy="true">
         <button type="button" className="detail-back" data-testid="agent-group-detail-back" onClick={onBack}>
           <BackIcon aria-hidden="true" />
           {t('agentManagement.actions.back')}
         </button>
-        <div className="detail-loading-center">
+        <div className="detail-body flex-1 min-h-0 overflow-y-auto">
+          {loadingSummary ? (
+            <>
+              <EntityHeader
+                testId="agent-management-detail-header"
+                avatar={<GroupAvatar item={loadingSummary} />}
+                title={loadingSummary.displayName}
+                titleTestId="agent-management-detail-name"
+                tags={[
+                  ...(loadingSummary.category?.trim()
+                    ? [t(`agentManagement.categories.${loadingSummary.category}`, { defaultValue: loadingSummary.category })]
+                    : []),
+                  t('agentManagement.detail.sourcePrefix', {
+                    source: t(`agentManagement.source.${loadingSummary.source}`),
+                  }),
+                  ...(loadingSummary.installed ? [t('agentManagement.states.installed')] : []),
+                ]}
+              />
+              <DetailSection testId="agent-management-detail-ability" title={t('agentManagement.detail.ability')}>
+                <p>{loadingSummary.description || t('agentManagement.unknownDescription')}</p>
+              </DetailSection>
+            </>
+          ) : null}
           <div
             className="agent-management-detail--state"
             data-testid="agent-group-detail-state"
@@ -127,10 +145,9 @@ export function AgentGroupDetailPage({
         {t('agentManagement.actions.back')}
       </button>
       <div className="detail-body flex-1 min-h-0 overflow-y-auto">
-        <PublicationDetailStatus kind="agent_group" localId={detail.id} />
         <EntityHeader
           testId="agent-management-detail-header"
-          avatar={<GroupAvatar item={detail} size="detail" />}
+          avatar={<GroupAvatar item={detail} />}
           title={detail.displayName}
           titleTestId="agent-management-detail-name"
           tags={[
@@ -141,11 +158,13 @@ export function AgentGroupDetailPage({
             ...(detail.installed ? [t('agentManagement.states.installed')] : []),
           ]}
           actions={
-            <div className="agent-management-detail__actions">
+            /* 收敛到共享类 .detail-actions/.detail-action（index.css，与 plugin/MCP/agent 模板
+               详情页同款）。原 .agent-management-detail__actions 一套私有类已删除。 */
+            <div className="detail-actions">
               {canShowAssetPublish(detail.installed, detail.capabilities.canPublish) ? (
                 <button
                   type="button"
-                  className="rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-text"
+                  className="detail-action"
                   data-testid="agent-management-agent-group-publish"
                   onClick={() =>
                     openAssetPublish({
@@ -155,13 +174,14 @@ export function AgentGroupDetailPage({
                     })
                   }
                 >
+                  <PromptSendIcon aria-hidden="true" />
                   {t('skills.actions.publish')}
                 </button>
               ) : null}
               {detail.installed && detail.capabilities.canUninstall ? (
                 <button
                   type="button"
-                  className="agent-management-detail-action agent-management-detail-action--uninstall"
+                  className="detail-action"
                   data-testid="agent-group-detail-action"
                   data-variant="uninstall"
                   disabled={busy}
@@ -177,7 +197,7 @@ export function AgentGroupDetailPage({
               {detail.installed ? (
                 <button
                   type="button"
-                  className="agent-management-button agent-management-button--secondary agent-management-detail-action--use"
+                  className="detail-action detail-action--use"
                   data-testid="agent-group-detail-action"
                   data-variant="use"
                   disabled={!canUse || busy}
@@ -191,7 +211,7 @@ export function AgentGroupDetailPage({
                   {canDelete ? (
                     <button
                       type="button"
-                      className="agent-management-detail-action agent-management-detail-action--uninstall"
+                      className="detail-action"
                       data-testid="agent-group-detail-action"
                       data-variant="delete"
                       disabled={busy}
@@ -205,7 +225,7 @@ export function AgentGroupDetailPage({
                   {detail.capabilities.canInstall ? (
                     <button
                       type="button"
-                      className="agent-management-button agent-management-button--primary agent-management-detail-action--install"
+                      className="detail-action detail-action--install"
                       data-testid="agent-group-detail-action"
                       data-variant="install"
                       disabled={busy}
@@ -222,11 +242,6 @@ export function AgentGroupDetailPage({
             </div>
           }
         />
-        {actionError ? (
-          <div className="agent-management-inline-error" role="alert">
-            {actionError}
-          </div>
-        ) : null}
         {actionNotice ? (
           <div className="agent-management-inline-notice" role="status">
             {actionNotice}
@@ -300,7 +315,6 @@ export function AgentGroupDetailPage({
                 <DetailPromptChip
                   key={`${index}-${prompt}`}
                   text={prompt}
-                  icon={<PromptSendIcon width={16} height={16} />}
                   disabled={!canUse || busy || !onUsePrompt}
                   onClick={() => onUsePrompt?.(detail.id, prompt)}
                   testId="agent-group-detail-prompt-send"
@@ -317,7 +331,7 @@ export function AgentGroupDetailPage({
               ariaLabel={t('agentManagement.group.detail.tabsLabel')}
               wrapperTestId="agent-group-detail-tabs"
               itemTestId="agent-group-detail-tab"
-              className="text-base"
+              className="page-tabs"
               value={detailTab}
               onChange={onTabChange}
               items={[

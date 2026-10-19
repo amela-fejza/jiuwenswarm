@@ -30,7 +30,7 @@ from jiuwenswarm.server.runtime.attachments.upload_storage import (
 logger = logging.getLogger(__name__)
 
 #: 浏览器上传文档的大小上限（base64 裸字节，base64 膨胀前）。
-_MAX_DOCUMENT_BYTES: int = 10 * 1024 * 1024
+_MAX_DOCUMENT_BYTES: int = 100 * 1024 * 1024
 #: 单次文档上传的最大条数（与图片 _MAX_IMAGE_COUNT 对齐）。
 _MAX_DOCUMENT_COUNT: int = 8
 
@@ -48,57 +48,12 @@ def _strip_data_uri_prefix(raw_base64: str) -> str:
     return raw_base64
 
 # Executable / script / package types rejected by document upload.
-FORBIDDEN_DOCUMENT_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".exe",
-        ".dll",
-        ".msi",
-        ".scr",
-        ".bat",
-        ".cmd",
-        ".ps1",
-        ".vbs",
-        ".wsf",
-        ".hta",
-        ".jar",
-        ".lnk",
-        ".bin",
-        ".so",
-        ".dylib",
-        ".app",
-        ".dmg",
-        ".pkg",
-        ".command",
-        ".scpt",
-        ".scptd",
-        ".workflow",
-        ".xpc",
-        ".bundle",
-        ".framework",
-        ".kext",
-        ".prefpane",
-        ".saver",
-        ".component",
-    }
+from jiuwenswarm.common.attachment_safety import (  # noqa: F401
+    FORBIDDEN_DOCUMENT_EXTENSIONS,
+    _document_suffix,
+    forbidden_formats,
+    is_forbidden_document,
 )
-
-
-def forbidden_formats() -> list[str]:
-    """Return sorted list of forbidden upload extensions."""
-    return sorted(FORBIDDEN_DOCUMENT_EXTENSIONS)
-
-
-def _document_suffix(filename: str | None) -> str:
-    name = Path(str(filename or "")).name
-    return Path(name).suffix.lower()
-
-
-def is_forbidden_document(*, filename: str | None = None, suffix: str | None = None) -> bool:
-    """Return True when the file extension is on the upload blacklist."""
-    ext = (suffix or _document_suffix(filename) or "").lower()
-    if not ext.startswith(".") and ext:
-        ext = f".{ext}"
-    return ext in FORBIDDEN_DOCUMENT_EXTENSIONS
 
 
 def is_supported_document(*, filename: str | None = None) -> bool:

@@ -6,7 +6,7 @@ export interface ProjectSessionBatchResult {
   project_id: string;
   succeeded_count: number;
   failed_count: number;
-  results: { session_id: string; ok: boolean; code?: string; error?: string; finishing?: boolean }[];
+  results: { session_id: string; ok: boolean; code?: string; error?: string; finishing?: boolean; subagent_finishing?: boolean }[];
 }
 
 export interface ProjectRemoveResult {
@@ -23,10 +23,11 @@ export const projectRegistryClient = {
       filter,
       ...(workMode ? { work_mode: workMode } : {}),
     }),
-  getSessions: (projectId: string, limit?: number) =>
+  getSessions: (projectId: string, limit?: number, workMode?: WorkMode) =>
     webRequest<{ sessions: Session[]; total: number }>('project.get_sessions', {
       project_id: projectId,
       ...(limit !== undefined ? { limit } : {}),
+      ...(workMode ? { work_mode: workMode } : {}),
     }),
   getCronSessions: (projectId: string, cronId?: string) =>
     webRequest<{ sessions: Session[]; total: number }>('project.get_cron_sessions', {

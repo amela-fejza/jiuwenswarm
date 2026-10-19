@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
-import { ChevronDown, ChevronRight, FileCode2, FileText } from 'lucide-react';
+import ArrowRightIcon from '../../../assets/work-mode/arrow-right.svg?react';
+import CollapseIcon from '../../../assets/work-mode/collapse.svg?react';
 import FolderAssetIcon from '../../../assets/work-mode/folder.svg?react';
 import FolderFoldAssetIcon from '../../../assets/work-mode/folder-fold.svg?react';
-import { isCodeFileName, type FilePreviewStatus } from './filePreviewShared';
+import { FilePreviewIcon } from './FilePreviewIcon';
+import { type FilePreviewStatus } from './filePreviewShared';
 
 export type FilePreviewTreeNode = {
   /** 唯一路径，用作 React key / 选中判断 / testid variant */
@@ -131,15 +133,13 @@ function TreeEntry({
             ) : (
               <FolderAssetIcon width={12} height={12} />
             )
-          ) : isCodeFileName(entry.label) ? (
-            <FileCode2 size={16} strokeWidth={1.5} />
           ) : (
-            <FileText size={16} strokeWidth={1.5} />
+            <FilePreviewIcon fileName={entry.label} size={16} />
           )}
         </span>
         <span className="file-preview-tree__entry-label">{entry.label}</span>
         <span className="file-preview-tree__entry-chevron" aria-hidden="true">
-          {isDirectory ? isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} /> : null}
+          {isDirectory ? isExpanded ? <CollapseIcon width={16} height={16} /> : <ArrowRightIcon width={16} height={16} /> : null}
         </span>
         {unsupported && notPreviewableLabel ? (
           <span className="file-preview-tree__entry-badge" data-testid={`${itemTestId}-unsupported`}>

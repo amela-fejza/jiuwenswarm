@@ -19,7 +19,7 @@ import {
   normalizeSkillOption,
   normalizeTeamMarketplaceSkill,
 } from './adapter';
-import type { McpOption, SkillOption } from './types';
+import type { AgentDraft, McpOption, SkillOption } from './types';
 import type {
   RawAgentDetailPayload,
   RawAgentFileListPayload,
@@ -31,6 +31,22 @@ import type {
 
 export { AgentManagementError } from './port';
 export type { AgentCatalogListOptions, AgentInstallResult, AgentManagementClient, SkillListOptions } from './port';
+
+function agentTemplateWritePayload(draft: AgentDraft) {
+  return {
+    id: draft.id,
+    name: draft.name,
+    description: draft.description,
+    persona: draft.persona,
+    tags: resolveAgentTagPayload(draft.tagIds, draft.customTags),
+    skills: draft.skillRefs,
+    mcps: draft.useExternalHarness ? [] : draft.mcpRefs,
+    quickInputs: draft.suggestedPrompts.filter((prompt) => prompt.trim().length > 0),
+    ...(draft.useExternalHarness
+      ? { runtime: { provider_name: draft.externalHarnessProvider, config: {} } }
+      : {}),
+  };
+}
 
 function rethrowAgentError(error: unknown): never {
   if (error instanceof AgentManagementError) {
@@ -214,6 +230,9 @@ export function createLiveAgentManagementClient(): AgentManagementClient {
         if (localResult.status === 'rejected') throw localResult.reason;
         const marketplace = marketplaceResult.status === 'fulfilled' ? marketplaceResult.value : [];
         const local = localResult.value;
+        // installed 沿用 mcp.list summary 的语义：预置恒为 true（包随应用分发，未连接也能发起
+        // 连接），hub 条目按真实安装态下发。抽屉"我的MCP" tab 的归属不依赖 installed，由
+        // AgentEditor 的 isMine 用 connectionState 判断，避免两个 tab 内容雷同。
         const byRuntimeName = new Map<string, McpOption>();
         [...marketplace, ...local].forEach((item) => {
           const runtimePackageName = item.runtimePackageName || item.name;
@@ -290,16 +309,7 @@ export function createLiveAgentManagementClient(): AgentManagementClient {
     },
     async createAgent(draft) {
       try {
-        await webRequest('agent_templates.create', {
-          id: draft.id,
-          name: draft.name,
-          description: draft.description,
-          persona: draft.persona,
-          tags: resolveAgentTagPayload(draft.tagIds, draft.customTags),
-          skills: draft.skillRefs,
-          mcps: draft.mcpRefs,
-          quickInputs: draft.suggestedPrompts.filter((prompt) => prompt.trim().length > 0),
-        });
+        await webRequest('agent_templates.create', agentTemplateWritePayload(draft));
         invalidateAgentCatalog();
       } catch (error) {
         return rethrowAgentError(error);
@@ -307,16 +317,7 @@ export function createLiveAgentManagementClient(): AgentManagementClient {
     },
     async updateAgent(draft) {
       try {
-        await webRequest('agent_templates.update', {
-          id: draft.id,
-          name: draft.name,
-          description: draft.description,
-          persona: draft.persona,
-          tags: resolveAgentTagPayload(draft.tagIds, draft.customTags),
-          skills: draft.skillRefs,
-          mcps: draft.mcpRefs,
-          quickInputs: draft.suggestedPrompts.filter((prompt) => prompt.trim().length > 0),
-        });
+        await webRequest('agent_templates.update', agentTemplateWritePayload(draft));
         invalidateAgentCatalog();
       } catch (error) {
         return rethrowAgentError(error);

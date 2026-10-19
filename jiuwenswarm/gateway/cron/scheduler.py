@@ -27,6 +27,7 @@ from jiuwenswarm.gateway.cron.models import (
 from jiuwenswarm.gateway.cron.store_base import CronJobStoreBackend
 from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
 from jiuwenswarm.runtime.events import TERMINAL_ERROR_EVENT_TYPES
+from jiuwenswarm.common.e2a.constants import E2A_MODEL_AUTH_PARAM_KEY
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
 from jiuwenswarm.common.schema.message import EventType, Message, ReqMethod
 from jiuwenswarm.common.work_mode import DEFAULT_WEB_WORK_MODE
@@ -55,8 +56,70 @@ def _is_cron_interrupt_event(event_type: str) -> bool:
     return str(event_type or "").strip() in CRON_INTERRUPT_EVENT_TYPES
 
 
+
+async def _safe_aclose(stream_gen: Any, request_id: str = "") -> None:
+    """Best-effort close of a stream generator; log failures instead of swallowing them.
+
+    ``aclose()`` can raise when generator cleanup or the underlying connection fails.
+    Cron jobs must still finish, but silent ``except Exception: pass`` leaves no trail
+    when sessions linger or resources leak.
+    """
+    if stream_gen is None:
+        return
+    closer = getattr(stream_gen, "aclose", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        logger.warning(
+            "[Cron] stream_gen.aclose failed request_id=%s",
+            request_id,
+            exc_info=True,
+        )
+
+
 def _now_utc_ts() -> float:
     return time.time()
+
+
+def _login_model_auth_for_job(job: CronJob) -> dict[str, Any] | None:
+    """登录免费模型的请求级凭据（``_model_auth`` 参数体）；未绑定或拿不到凭据返回 ``None``。
+
+    AgentServer 不持有登录凭据，交互请求由 Gateway 转发时统一挂上
+    （``common/auth/passthrough.py``）；cron 执行请求直发 AgentServer、不走那条
+    转发路径，这里按任务创建时绑定的凭据句柄（``CronJob.credential_ref``，来自
+    创建连接的服务端登录会话）补挂。绑定即"所选模型是登录模型"的标记：
+    自配模型即使与登录模型同名也没有绑定，不会被误注入登录凭据。路由
+    user_id 与华为账号是两套独立用户体系，互不可推导，不在此做任何按名/按
+    user_id 的猜测。含同步续期 HTTP（token 未临近过期时 ``try_refresh`` 直接
+    返回，不发请求），调用方放线程里跑。
+
+    拿不到凭据不在这里报错：AgentServer 对"登录模型没带凭据"有面向用户的
+    ``login_required`` 报错，任务以明确原因失败，而不是静默换默认模型。
+    """
+    from jiuwenswarm.common.auth.apig import resolve_apig_config
+    from jiuwenswarm.common.auth.login_credentials import is_credential_ref
+    from jiuwenswarm.common.auth.passthrough import refreshed_credential_for_ref
+
+    ref = str(getattr(job, "credential_ref", "") or "").strip()
+    if not ref or not is_credential_ref(ref):
+        return None
+    fresh = refreshed_credential_for_ref(ref)
+    if (
+        not isinstance(fresh, dict)
+        or fresh.get("revoked")
+        or not str(fresh.get("api_key") or "").strip()
+    ):
+        return None
+    apig_config = resolve_apig_config(allow_refresh=False)
+    if apig_config is None:
+        return None
+    return {
+        "api_base": apig_config.invoke_base_url,
+        "api_key": str(fresh["api_key"]),
+        "credential_ref": ref,
+    }
 
 
 def _resolve_cron_execution_context(
@@ -65,12 +128,17 @@ def _resolve_cron_execution_context(
     ts: str,
     message_handler: MessageHandler | None = None,
 ) -> tuple[str, str]:
-    """Resolve channel_id and session_id for team cron agent execution.
+    """Resolve the placeholder channel_id and session_id for team cron runs.
 
     Team jobs always use an isolated ``cron_*`` session so scheduled runs start
     fresh and are not cancelled when the creator TUI/web window closes
     (``cancel_agent_sessions_on_disconnect``). ``job.session_id`` is kept for IM
     push routing only.
+
+    The ``cron_<ts>_<job.id>`` id built here is a transient placeholder: both
+    the scheduled wake path and ``trigger_run_now_info`` replace it with the
+    session explicitly created via ``_allocate_execution_session`` (which
+    carries ``cron_id``), keeping team and single-agent linkage identical.
     """
     _ = message_handler
     channel_id = (job.targets or CronTargetChannel.TUI.value).strip() or CronTargetChannel.TUI.value
@@ -751,11 +819,25 @@ class CronSchedulerService:
             return True
         from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
         revision = self._project_admission_revisions.get(project_id, 0)
+        _t0 = time.monotonic()
         ok, payload = await fetch_agent_unary(
             agent_client=self._agent_client, req_method=ReqMethod.PROJECT_LIFECYCLE,
             params={"project_id": project_id}, session_id=None, user_id=user_id,
             channel_id="__cron__", timeout_seconds=10,
         )
+        # 计时供 issue #4885 观察闸门 RPC 的耗时分布：>500ms 升 info，
+        # 线上默认日志级别可见，作为是否需要准入缓存（第二步）的判断依据。
+        _elapsed_ms = (time.monotonic() - _t0) * 1000
+        if _elapsed_ms > 500:
+            logger.info(
+                "[Cron] gate rpc slow project=%s user=%s elapsed_ms=%.0f ok=%s",
+                project_id, user_id, _elapsed_ms, ok,
+            )
+        else:
+            logger.debug(
+                "[Cron] gate rpc project=%s user=%s elapsed_ms=%.0f ok=%s",
+                project_id, user_id, _elapsed_ms, ok,
+            )
         # 隐藏(移除)项目的定时任务一律不放行:不到点触发、不进任务列表、
         # 不可手动启用/立即执行。enabled 标志在项目移除时已被停用,这里是
         # 防止任何路径(如历史数据)让隐藏项目的任务继续跑的执行层闸门。
@@ -897,18 +979,28 @@ class CronSchedulerService:
         # 普通 cron 原先先把本地构造的 ``cron_<timestamp>_<job>`` 返回给 Web，
         # 再在 wake 阶段向 AgentServer 创建真正的 session。两个 ID 不同，前端会
         # 先跳到不存在的 warmup 占位页。立即分配并返回真正的执行 session，wake
-        # 阶段复用它即可；team cron 的 session 仍由原有流式路径创建。
+        # 阶段复用它即可。
+        # team cron 历史上由流式 chat.send 在 AgentServer 侧隐式建会话，会话与
+        # 任务的 ``cron_id`` 关联依赖聊天准入的元数据同步
+        # （``prepare_chat_turn → sync_chat_request_metadata``）这一隐性副作用：
+        # 链路一旦被跳过（现场出现过旧版 auto team binding 先落了一份无
+        # cron_id 的 metadata），任务照常执行、结果照常推送，但执行会话永远
+        # 进不了前端"触发的会话"列表（project.get_cron_sessions 按 cron_id 过滤）。
+        # team 同样在此显式 session.create（带 cron_id）预建执行会话，两条路径归一。
         # proactive.tick has its own wake handler and sends PROACTIVE_TICK to a
         # stable session (``cron_<job_id>``).  It never consumes a normal cron
         # chat session, so allocating one here would leave an orphan session.
         mode = state.exec_mode or CRON_JOB_DEFAULT_MODE
-        if mode != "proactive.tick" and not is_team_cron_mode(mode):
-            state.exec_session_id = await self._allocate_single_agent_session(
+        if mode != "proactive.tick":
+            state.exec_session_id = await self._allocate_execution_session(
                 job,
                 mode=mode,
                 run_id=run_id,
             )
-            state.exec_channel_id = "__cron__"
+            if not is_team_cron_mode(mode):
+                # team 的流式事件按 targets 渠道回传（SwarmFlow 直播到 Web/TUI），
+                # 执行渠道路由保留 targets；单 agent 恒走内部 ``__cron__`` 渠道。
+                state.exec_channel_id = "__cron__"
             state.execution_session_allocated = True
         self._runs[run_id] = state
         self._schedule_event(wake_dt, "wake", job.id, run_id)
@@ -927,7 +1019,7 @@ class CronSchedulerService:
             )
         return "__cron__", f"cron_{ts}_{job.id}"
 
-    async def _allocate_single_agent_session(
+    async def _allocate_execution_session(
         self,
         job: CronJob,
         *,
@@ -1411,13 +1503,20 @@ class CronSchedulerService:
                 state.exec_work_mode = job.work_mode or DEFAULT_WEB_WORK_MODE
                 state.exec_project_id = job.project_id or None
                 state.exec_project_dir = None
-                if not is_team_cron_mode(mode) and not state.execution_session_allocated:
-                    exec_session_id = await self._allocate_single_agent_session(
+                # 所有模式（含 team）统一显式预建执行会话：session.create 直接带
+                # cron_id，会话与任务的关联不再依赖聊天准入元数据同步的隐性副作用
+                # （team 旧链路因此出现过"任务执行成功但触发的会话列表为空"）。
+                # run_now 已分配过的（execution_session_allocated）在此复用。
+                if not state.execution_session_allocated:
+                    exec_session_id = await self._allocate_execution_session(
                         job,
                         mode=mode,
                         run_id=run_id,
                     )
-                    state.exec_channel_id = "__cron__"
+                    if not is_team_cron_mode(mode):
+                        # team 的流式事件按 targets 渠道回传，保留渠道路由；
+                        # 单 agent 恒走内部 ``__cron__`` 渠道。
+                        state.exec_channel_id = "__cron__"
                     state.exec_session_id = exec_session_id
                     state.execution_session_allocated = True
                 cron_meta = {
@@ -1441,6 +1540,23 @@ class CronSchedulerService:
                     params["model_name"] = job.model_name
                 if job.model_selection:
                     params["model_selection"] = dict(job.model_selection)
+                # 登录免费模型：凭据随请求带给 AgentServer（cron 直发路径
+                # 不经过 Gateway 转发时的统一挂载，这里补挂）。挂不上不拦
+                # 执行——AgentServer 对"登录模型没带凭据"有 login_required
+                # 报错，任务以明确原因失败。
+                try:
+                    login_auth = await asyncio.to_thread(
+                        _login_model_auth_for_job, job
+                    )
+                except Exception:  # noqa: BLE001 — 凭据挂载失败不拦执行
+                    login_auth = None
+                    logger.warning(
+                        "[Cron] login model auth lookup failed job_id=%s",
+                        job.id,
+                        exc_info=True,
+                    )
+                if login_auth is not None:
+                    params[E2A_MODEL_AUTH_PARAM_KEY] = login_auth
                 # 会话级 MCP 选择：注入 chat.send 的 ``mcp`` 字段，走 AgentServer
                 # 与 chat-session 相同的 reconcile_session_mcp 通道（增量注册/注销）；
                 # 未配置（None）时保持既有行为（仅 init 全局默认集）。
@@ -1484,6 +1600,7 @@ class CronSchedulerService:
                         mode=mode,
                         timeout_seconds=timeout_seconds,
                     )
+                    stream_completed = ok
                 else:
                     timeout_seconds = resolve_cron_job_timeout_seconds(job)
                     # Some model adapters acknowledge a unary request with an
@@ -1493,16 +1610,13 @@ class CronSchedulerService:
                     # result.  Keep normal user chats unchanged; only cron
                     # execution uses the stream completion signal.
                     envelope.is_stream = True
-                    text, ok = await self._run_stream_cron_job(
+                    text, ok, stream_completed = await self._run_stream_cron_job(
                         envelope=envelope,
                         timeout_seconds=timeout_seconds,
                         state=state,
                     )
-                # 仅当 agent 请求成功时才把执行会话记为 last_session_id：
-                # last_session_id 表示『最近一次成功执行的会话』，用于后续续跑
-                # （老会话的 chat_final 是已推送的结果）。请求失败/超时不更新，
-                # 避免把一次失败的执行会话误当作可续跑的最近成功会话。
-                if ok:
+                # #4980：回写与文本产出解耦；失败、超时或中断不覆盖成功会话。
+                if stream_completed:
                     await self._mark_last_session_ready(job, exec_session_id)
                 state.result_text = text
                 state.status = "succeeded" if ok else "failed"
@@ -1742,17 +1856,20 @@ class CronSchedulerService:
         envelope: Any,
         timeout_seconds: float,
         state: CronRunState,
-    ) -> tuple[str, bool]:
-        """Run a single-agent cron turn until its terminal stream result."""
+    ) -> tuple[str, bool, bool]:
+        """Return ``(text, ok, completed)``; completion does not require text."""
         stream_gen = self._agent_client.send_request_stream(envelope)
         interrupted = False
 
-        async def _consume() -> tuple[str, bool]:
+        async def _consume() -> tuple[str, bool, bool]:
             nonlocal interrupted
             result_text = ""
             error_text = ""
+            saw_complete = False
             try:
                 async for chunk in stream_gen:
+                    # Terminal markers can have no payload; EOF alone is insufficient.
+                    saw_complete = saw_complete or bool(chunk.is_complete)
                     payload = chunk.payload if isinstance(chunk.payload, dict) else None
                     if not payload:
                         continue
@@ -1760,6 +1877,8 @@ class CronSchedulerService:
                     text = _extract_text_from_stream_payload(payload)
                     if event_type == "chat.error":
                         error_text = text or "任务执行失败"
+                    elif event_type in TERMINAL_ERROR_EVENT_TYPES or (not event_type and "error" in payload):
+                        error_text = str(payload.get("error") or payload.get("message") or "").strip() or "任务执行失败"
                     elif text:
                         result_text = text
                     if _is_cron_interrupt_event(event_type):
@@ -1768,10 +1887,9 @@ class CronSchedulerService:
                         interrupted = True
                         break
             finally:
-                try:
-                    await stream_gen.aclose()
-                except Exception:
-                    pass
+                await _safe_aclose(
+                    stream_gen, getattr(envelope, "request_id", "")
+                )
 
             if interrupted:
                 logger.warning(
@@ -1779,12 +1897,15 @@ class CronSchedulerService:
                     "request_id=%s",
                     getattr(envelope, "request_id", ""),
                 )
-                return CRON_INTERRUPT_RESULT_TEXT, False
+                return CRON_INTERRUPT_RESULT_TEXT, False, False
             if error_text:
-                return error_text, False
+                return error_text, False, False
+            if not saw_complete:
+                return "[cron] 任务执行流提前结束，未收到完成信号", False, False
             if result_text:
-                return result_text, True
-            return "[cron] 任务执行完成但未返回结果内容", False
+                return result_text, True, True
+            # #4980：无文本完成也回写，保留原有无结果状态和推送文案。
+            return "[cron] 任务执行完成但未返回结果内容", False, True
 
         try:
             result = await asyncio.wait_for(_consume(), timeout=timeout_seconds)
@@ -1801,7 +1922,7 @@ class CronSchedulerService:
                 getattr(envelope, "request_id", ""),
             )
             await self._cancel_agent_session(state, reason="timeout")
-            return f"[cron] 任务执行超时（>{timeout_min}min）", False
+            return f"[cron] 任务执行超时（>{timeout_min}min）", False, False
 
     async def _run_team_stream_job(
         self,
@@ -1912,10 +2033,9 @@ class CronSchedulerService:
                         consume_meta["ended_early"] = not chunk.is_complete
                         break
             finally:
-                try:
-                    await stream_gen.aclose()
-                except Exception:
-                    pass
+                await _safe_aclose(
+                    stream_gen, getattr(envelope, "request_id", "")
+                )
 
             if consume_meta.get("interrupted"):
                 # 中断意味着本轮已停在等人回答的点上，leader/workflow 的部分输出
@@ -1962,10 +2082,9 @@ class CronSchedulerService:
                 timeout_seconds,
                 getattr(envelope, "request_id", ""),
             )
-            try:
-                await stream_gen.aclose()
-            except Exception:
-                pass
+            await _safe_aclose(
+                stream_gen, getattr(envelope, "request_id", "")
+            )
             await self._cancel_cron_team_agent_session(
                 envelope=envelope,
                 exec_session_id=exec_session_id,
@@ -1984,10 +2103,9 @@ class CronSchedulerService:
                 getattr(envelope, "request_id", ""),
                 exc_info=True,
             )
-            try:
-                await stream_gen.aclose()
-            except Exception:
-                pass
+            await _safe_aclose(
+                stream_gen, getattr(envelope, "request_id", "")
+            )
             await self._cancel_cron_team_agent_session(
                 envelope=envelope,
                 exec_session_id=exec_session_id,

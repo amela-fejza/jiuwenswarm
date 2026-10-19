@@ -173,17 +173,19 @@ test('all four kinds open the shared review, retain moderation result, and never
     );
     await tick();
     assert.ok(find('asset-publish-review'));
+    assert.equal(find('asset-publish-notice'), null);
     assert.equal(submits.at(-1)[2], '');
     assert.equal(submits.at(-1)[3], false);
     await act(async () => find('asset-publish-commit').click());
     await tick();
-    assert.equal(find('asset-publish-result').dataset.variant, 'pending_moderation');
+    assert.equal(find('asset-publish-result').dataset.variant, 'submitted');
     assert.ok(find('asset-publish-result-header'));
     assert.ok(find('asset-publish-result-metadata'));
     assert.match(find('asset-publish-result-metadata').textContent, /hub-asset/);
     assert.match(find('asset-publish-result-metadata').textContent, /1\.0\.0/);
     assert.ok(find('asset-publish-result-footer'));
     assert.equal(find('asset-publish-new-version').closest('[data-testid="asset-publish-result-footer"]') !== null, true);
+    assert.equal(find('asset-publish-notice'), null);
     assert.equal(find('asset-publish-visibility-unconfirmed'), null);
     await act(async () => find('asset-publish-close').click());
   }
@@ -257,7 +259,7 @@ test('unresolved submission cannot be replaced by old history or lose its retry 
   });
   await act(async () => find('asset-publish-refresh').click());
   await tick();
-  assert.equal(find('asset-publish-result').dataset.variant, 'pending_moderation');
+  assert.equal(find('asset-publish-result').dataset.variant, 'submitted');
   assert.ok(find('asset-publish-new-version'));
   await act(async () => find('asset-publish-close').click());
 });
@@ -287,6 +289,31 @@ test('definitive expired draft rejection unlocks editing and requires a new pack
     await act(async () => find('asset-publish-close').click());
   }
 });
+test('Hub request rejection identifies Hub and gives actionable guidance', async () => {
+  assetPublishApi.describe = async () => description;
+  assetPublishApi.prepare = async () => draft;
+  assetPublishApi.commit = async () => ({
+    operation_id: 'hub-rejected-operation',
+    draft_id: 'draft',
+    execution_status: 'failed',
+    result: null,
+    error: { code: 'hub_request_failed' },
+    updated_at: '2026-09-24T06:00:00Z',
+  });
+  await act(async () => openAssetPublish({ kind: 'agent_template', local_id: 'hub-rejected' }));
+  await tick();
+  await act(async () =>
+    find('asset-publish-form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })),
+  );
+  await tick();
+  await act(async () => find('asset-publish-commit').click());
+  await tick();
+  const message = document.querySelector('.asset-publish-result-error').textContent;
+  assert.match(message, /Hub did not accept this publishing request/);
+  assert.match(message, /contact the Hub administrator/);
+  assert.doesNotMatch(message, /hub_request_failed/i);
+  await act(async () => find('asset-publish-close').click());
+});
 test('polling completion updates the matching history row', async () => {
   const queued = { operation_id: 'polled', draft_id: 'draft', execution_status: 'queued', result: null, error: null };
   assetPublishApi.describe = async () => ({ ...description, records: [queued] });
@@ -300,7 +327,53 @@ test('polling completion updates the matching history row', async () => {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 2100));
   });
-  assert.match(find('asset-publish-record').textContent, /pending moderation/i);
+  const polledRow = find('asset-publish-record').textContent;
+  assert.match(polledRow, /submitted/i);
+  assert.doesNotMatch(polledRow, /pending moderation/i);
+  await act(async () => find('asset-publish-close').click());
+});
+test('completed records use the same local text, variants, and icon regardless of Hub result', async () => {
+  for (const publishResult of ['pending_moderation', 'published', 'unrecognized']) {
+    const record = {
+      operation_id: `local-${publishResult}`,
+      execution_status: 'completed',
+      result: { publish_result: publishResult, version: '1.0.0' },
+      error: null,
+    };
+    assetPublishApi.describe = async () => ({ ...description, records: [record] });
+    assetPublishApi.records = async () => ({ records: [record] });
+    await act(async () => openAssetPublish({ kind: 'plugin', local_id: record.operation_id }));
+    await tick();
+
+    assert.equal(find('asset-publish-result').dataset.variant, 'submitted');
+    assert.equal(find('asset-publish-result-status').textContent, 'Submitted');
+    assert.ok(find('asset-publish-result-icon').querySelector('svg.lucide-circle-check'));
+    const historyRow = find('asset-publish-record');
+    assert.equal(historyRow.dataset.variant, record.operation_id);
+    const status = find('asset-publish-record-status');
+    assert.equal(status.textContent, 'Submitted');
+    assert.equal(status.dataset.variant, 'submitted');
+    await act(async () => find('asset-publish-close').click());
+  }
+});
+test('unconfirmed submissions keep their local variant and waiting icon', async () => {
+  const record = {
+    operation_id: 'local-unconfirmed',
+    execution_status: 'unknown',
+    result: null,
+    error: null,
+  };
+  assetPublishApi.describe = async () => ({ ...description, records: [record] });
+  assetPublishApi.records = async () => ({ records: [record] });
+  await act(async () => openAssetPublish({ kind: 'plugin', local_id: record.operation_id }));
+  await tick();
+
+  assert.equal(find('asset-publish-result').dataset.variant, 'unconfirmed');
+  assert.equal(find('asset-publish-result-status').textContent, 'Submission result unconfirmed');
+  assert.ok(find('asset-publish-result-icon').querySelector('svg.lucide-clock-3'));
+  const status = find('asset-publish-record-status');
+  assert.equal(status.textContent, 'Submission result unconfirmed');
+  assert.equal(status.dataset.variant, 'unconfirmed');
   await act(async () => find('asset-publish-close').click());
 });
 test('OAuth restore contains metadata and does not auto prepare or commit', async () => {

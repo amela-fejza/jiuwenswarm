@@ -342,47 +342,114 @@ async def test_busy_session_archive_has_no_side_effects(archive):
     await service.session("sess_a", "archive", "web")
 
 
-def test_runtime_running_check_includes_team_without_stopping(monkeypatch):
+@pytest.mark.parametrize("state", ["queued", "running", "waiting_for_control", "succeeded", "failed", "cancelled"])
+def test_runtime_running_check_counts_only_running(state, monkeypatch):
     from jiuwenswarm.runtime.service import AgentRuntime
     from jiuwenswarm.runtime.session.model import SessionExecutionState
     from jiuwenswarm.agents.harness.team import team_manager
 
+    state = SessionExecutionState(state)
     snapshot = SimpleNamespace(
-        executions=[SimpleNamespace(state=SessionExecutionState.RUNNING)]
+        executions=[SimpleNamespace(state=state)]
     )
     runtime = SimpleNamespace(
         _session_coordinator=SimpleNamespace(snapshot_session=lambda sid: snapshot)
     )
     monkeypatch.setattr(team_manager, "_team_manager", None)
-    assert AgentRuntime.is_session_running(runtime, "sess_a")
-    snapshot.executions[0].state = SessionExecutionState.SUCCEEDED
-    assert not AgentRuntime.is_session_running(runtime, "sess_a")
-    # 等待本轮 round 的准备阶段（spec 组装/运行时激活）也算运行中。
-    manager = SimpleNamespace(
-        has_inflight_request=lambda sid: True,
-        is_round_active=lambda sid: False,
-    )
-    monkeypatch.setattr(team_manager, "_team_manager", manager)
-    assert AgentRuntime.is_session_running(runtime, "sess_a")
-    # round 终止后即使持久 stream 与运行时仍在（idle 常驻），也不得算运行中。
-    manager = SimpleNamespace(
-        has_inflight_request=lambda sid: False,
-        is_round_active=lambda sid: True,
-    )
-    assert AgentRuntime.is_session_running(runtime, "sess_a")
-    manager = SimpleNamespace(
-        has_inflight_request=lambda sid: False,
-        is_round_active=lambda sid: False,
-        has_stream_task=lambda sid: True,
-        is_runtime_active=lambda sid: True,
-        is_runtime_pending=lambda sid: True,
-    )
-    monkeypatch.setattr(team_manager, "_team_manager", manager)
-    assert not AgentRuntime.is_session_running(runtime, "sess_a")
+    assert AgentRuntime.is_session_running(runtime, "sess_a") is (state is SessionExecutionState.RUNNING)
 
 
 @pytest.mark.asyncio
-async def test_chat_preparation_blocks_archive_until_all_requests_finish(archive, monkeypatch):
+@pytest.mark.parametrize("action", ["archive", "delete"])
+@pytest.mark.parametrize("phase", ["running", "pausing", "idle", "paused"])
+async def test_local_runner_team_execution_controls_lifecycle_busy(
+    archive, monkeypatch, action, phase,
+):
+    from openjiuwen.agent_teams.agent.member_activity import MemberActivityRegistry
+    from openjiuwen.agent_teams.agent.stream_controller import StreamController
+    from openjiuwen.agent_teams.agent.team_agent import TeamAgent
+    from openjiuwen.agent_teams.runtime.manager import TeamRuntimeManager
+    from openjiuwen.agent_teams.runtime.pool import ActiveTeam
+    from openjiuwen.core.runner.runner import GLOBAL_RUNNER
+    from openjiuwen.harness_protocol.state import HarnessState
+    from jiuwenswarm.agents.harness.team import team_manager
+    from jiuwenswarm.runtime.service import AgentRuntime
+
+    service, create, root, runtime = archive
+    create()
+    manager = team_manager.TeamManager()
+    monkeypatch.setattr(team_manager, "_team_manager", manager)
+    monkeypatch.setattr(manager, "_is_distributed_mode", lambda config: False)
+    runner = TeamRuntimeManager()
+    monkeypatch.setattr(GLOBAL_RUNNER, "_team_runtime_manager", runner, raising=False)
+    agent = TeamAgent.__new__(TeamAgent)
+    agent._stream_controller = StreamController.__new__(StreamController)
+    agent._stream_controller._resources = SimpleNamespace(
+        harness=SimpleNamespace(state=HarnessState(phase)),
+    )
+    agent._configurator = SimpleNamespace(harness=agent._stream_controller._resources.harness)
+    agent._state = SimpleNamespace(member_registry=MemberActivityRegistry("leader"))
+    # Ordinary Teams live in the Runner pool, not the local/distributed cache.
+    await runner.pool.add(ActiveTeam("team", agent, "sess_a"))
+    assert manager.get_team_agent("sess_a") is None
+    assert not await manager.attach_distributed_hooks_for_runner_runtime("team", "sess_a", "web")
+    assert manager.get_team_agent("sess_a") is agent
+    manager.begin_round("sess_a", "old-owner")
+    runtime._session_coordinator = SimpleNamespace(snapshot_session=lambda sid: None)
+    runtime.is_session_running = lambda sid: AgentRuntime.is_session_running(runtime, sid)
+
+    if phase in {"running", "pausing"}:
+        with pytest.raises(lc.LifecycleError) as error:
+            await service.session("sess_a", action, "web")
+        assert error.value.code == "SESSION_BUSY"
+        assert (root / "sessions/sess_a").exists()
+        runtime.stop_session_for_archive.assert_not_awaited()
+        runtime.delete_session.assert_not_awaited()
+    else:
+        assert (await service.session("sess_a", action, "web"))["ok"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["archive", "delete"])
+@pytest.mark.parametrize("state", ["queued", "waiting_for_control", "succeeded"])
+async def test_nonexecuting_session_with_orphan_team_round_can_be_removed(
+    archive, monkeypatch, action, state,
+):
+    from jiuwenswarm.agents.harness.team import team_manager
+    from jiuwenswarm.runtime.service import AgentRuntime
+    from jiuwenswarm.runtime.session.model import SessionExecutionState
+
+    service, create, root, runtime = archive
+    create()
+    manager = team_manager.TeamManager()
+    monkeypatch.setattr(team_manager, "_team_manager", manager)
+    # The owner handler has gone, but its admission and persistent stream remain.
+    manager.begin_request("sess_a", "orphan")
+    manager.begin_round("sess_a", "orphan")
+    stream = asyncio.get_running_loop().create_future()
+    manager._stream_tasks["sess_a"] = stream
+    runtime._pending_chat_requests = {"sess_a": {"orphan"}}
+    runtime._session_coordinator = SimpleNamespace(
+        snapshot_session=lambda sid: SimpleNamespace(
+            executions=[SimpleNamespace(state=SessionExecutionState(state))],
+        ),
+    )
+    runtime.is_session_running = lambda sid: AgentRuntime.is_session_running(runtime, sid)
+    try:
+        assert not runtime.is_session_running("sess_a")
+        assert (await service.session("sess_a", action, "web"))["ok"]
+        if action == "archive":
+            assert not (root / "sessions/sess_a").exists()
+            assert (root / "sessions_archived/sess_a").exists()
+        else:
+            runtime.stop_session_for_archive.assert_awaited_once()
+            runtime.delete_session.assert_awaited_once()
+    finally:
+        stream.cancel()
+
+
+@pytest.mark.asyncio
+async def test_chat_preparation_does_not_block_archive(archive, monkeypatch):
     from jiuwenswarm.runtime.service import AgentRuntime
     from jiuwenswarm.agents.harness.team import team_manager
 
@@ -395,25 +462,25 @@ async def test_chat_preparation_blocks_archive_until_all_requests_finish(archive
 
     AgentRuntime.begin_chat_request(runtime, "sess_a", "first")
     AgentRuntime.begin_chat_request(runtime, "sess_a", "second")
-    with pytest.raises(lc.LifecycleError, match="running") as error:
-        await service.session("sess_a", "archive", "web")
-    assert error.value.code == "SESSION_BUSY"
-    AgentRuntime.end_chat_request(runtime, "sess_a", "first")
-    assert runtime.is_session_running("sess_a")
-    AgentRuntime.end_chat_request(runtime, "sess_a", "second")
     assert not runtime.is_session_running("sess_a")
     await service.session("sess_a", "archive", "web")
+    AgentRuntime.end_chat_request(runtime, "sess_a", "first")
+    assert not runtime.is_session_running("sess_a")
+    AgentRuntime.end_chat_request(runtime, "sess_a", "second")
+    assert not runtime.is_session_running("sess_a")
     assert (root / "sessions_archived/sess_a").exists()
 
 
 @pytest.mark.asyncio
-async def test_chat_admission_marks_session_busy_before_team_binding(archive, monkeypatch):
+async def test_chat_admission_does_not_mark_session_busy_before_team_binding(archive, monkeypatch):
     from jiuwenswarm.common.schema.message import ReqMethod
     from jiuwenswarm.runtime.service import AgentRuntime
     from jiuwenswarm.server import agent_ws_server as module
+    from jiuwenswarm.agents.harness.team import team_manager
 
     service, create, _, runtime = archive
     create()
+    monkeypatch.setattr(team_manager, "_team_manager", None)
     runtime._pending_chat_requests = {}
     runtime._session_coordinator = SimpleNamespace(snapshot_session=lambda sid: None)
     runtime.is_session_running = lambda sid: AgentRuntime.is_session_running(runtime, sid)
@@ -449,9 +516,8 @@ async def test_chat_admission_marks_session_busy_before_team_binding(archive, mo
     task = asyncio.create_task(server._handle_message(object(), "{}", asyncio.Lock()))
     try:
         await asyncio.wait_for(entered.wait(), 3)
-        with pytest.raises(lc.LifecycleError) as error:
-            await service.session("sess_a", "archive", "web")
-        assert error.value.code == "SESSION_BUSY"
+        assert not runtime.is_session_running("sess_a")
+        assert (await service.session("sess_a", "archive", "web"))["ok"]
     finally:
         release.set()
         await task
@@ -856,20 +922,26 @@ async def test_parked_team_stream_archive_proceeds_without_touching_stream(
     archive, monkeypatch
 ):
     from jiuwenswarm.agents.harness.team import team_manager
+    from jiuwenswarm.runtime.service import AgentRuntime
 
     service, create, root, runtime = archive
     create()
     stop_session_runtime = AsyncMock()
     manager = SimpleNamespace(
+        get_team_agent=lambda sid: None,
+        find_background_task_controller=lambda sid: None,
+        get_workflow_handler=lambda sid: None,
         has_stream_task=lambda sid: True,
+        has_inflight_request=lambda sid: False,
+        is_round_active=lambda sid: False,
         is_round_ended_request=lambda sid, rid: True,
         stop_session_runtime=stop_session_runtime,
     )
     monkeypatch.setattr(team_manager, "_team_manager", manager)
-    # The runtime would report the session busy (parked handler pending);
-    # only the parked exemption lets the archive through.
-    runtime.is_session_running = Mock(return_value=True)
-    runtime.has_parked_team_streams = Mock(return_value=True)
+    runtime._pending_chat_requests = {"sess_a": {"req_1"}}
+    runtime._session_coordinator = SimpleNamespace(snapshot_session=lambda sid: None)
+    runtime.is_session_running = lambda sid: AgentRuntime.is_session_running(runtime, sid)
+    assert not runtime.is_session_running("sess_a")
 
     original_begin = lc.begin
     begin_calls = []
@@ -882,9 +954,8 @@ async def test_parked_team_stream_archive_proceeds_without_touching_stream(
     payload = await service.session("sess_a", "archive", "web")
 
     assert payload["ok"] is True
-    # Only the busy check changes: archive keeps its unfenced lifecycle
-    # generation, so a failed move cannot leave the session blocked.
-    assert begin_calls == [False]
+    # Fence new execution while preserving the parked response stream.
+    assert begin_calls == [True]
     assert (root / "sessions_archived/sess_a/history.json").exists()
     assert not (root / "sessions/sess_a").exists()
     # The parked leader stream is released by its own lifecycle (disconnect,
@@ -893,25 +964,33 @@ async def test_parked_team_stream_archive_proceeds_without_touching_stream(
 
 
 @pytest.mark.asyncio
-async def test_parked_team_stream_delete_proceeds_and_stops_runtime(archive):
+async def test_parked_team_stream_delete_proceeds_and_stops_runtime(archive, monkeypatch):
+    from jiuwenswarm.agents.harness.team import team_manager
+    from jiuwenswarm.runtime.service import AgentRuntime
+
     service, create, _, runtime = archive
     create()
-    # The runtime would report the session busy (parked handler pending);
-    # the parked exemption lets the delete through, and unlike archive the
-    # delete's stop path tears the team runtime (and the persistent stream
-    # parked on it) down before the directory goes away.
-    runtime.is_session_running = Mock(return_value=True)
-    runtime.has_parked_team_streams = Mock(return_value=True)
+    manager = SimpleNamespace(
+        get_team_agent=lambda sid: SimpleNamespace(is_agent_running=lambda: sid == "sess_b"),
+        find_background_task_controller=lambda sid: None,
+        get_workflow_handler=lambda sid: None,
+        has_stream_task=lambda sid: True,
+        has_inflight_request=lambda sid: False,
+        is_round_active=lambda sid: sid == "sess_b",
+        is_round_ended_request=lambda sid, rid: True,
+    )
+    monkeypatch.setattr(team_manager, "_team_manager", manager)
+    runtime._pending_chat_requests = {"sess_a": {"req_1"}, "sess_b": {"req_2"}}
+    runtime._session_coordinator = SimpleNamespace(snapshot_session=lambda sid: None)
+    runtime.is_session_running = lambda sid: AgentRuntime.is_session_running(runtime, sid)
 
     payload = await service.session("sess_a", "delete", "web")
 
     assert payload["ok"] is True
     runtime.stop_session_for_archive.assert_awaited_once()
     runtime.delete_session.assert_awaited_once()
-    # A stream that is not fully parked — a request still preparing or
-    # mid-round — keeps the delete busy.
+    # An executing leader still keeps delete busy.
     create("sess_b")
-    runtime.has_parked_team_streams = Mock(return_value=False)
     with pytest.raises(lc.LifecycleError) as error:
         await service.session("sess_b", "delete", "web")
     assert error.value.code == "SESSION_BUSY"
@@ -1257,7 +1336,7 @@ async def test_team_round_finishing_after_flow_probe(monkeypatch):
     manager = team_manager.TeamManager()
     monkeypatch.setattr(team_manager, "_team_manager", manager)
     # 无 waiter 的 flow 终态事件会走 gateway 推送兜底，单测里没有 server 实例。
-    monkeypatch.setattr(manager, "_push_workflow_event_without_waiter", AsyncMock())
+    monkeypatch.setattr(manager, "_push_event_without_waiter", AsyncMock())
 
     def run_state(status):
         return SimpleNamespace(is_terminal=status in ("completed", "failed", "stopped"))
@@ -1309,6 +1388,98 @@ async def test_team_round_finishing_after_flow_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_terminal_frame_without_waiters_falls_back_to_server_push(monkeypatch):
+    """A mailbox-driven round has no waiter; its terminal frame must still reach the frontend."""
+    from jiuwenswarm.agents.harness.team import team_manager
+
+    manager = team_manager.TeamManager()
+    monkeypatch.setattr(team_manager, "_team_manager", manager)
+    push = AsyncMock()
+    monkeypatch.setattr(manager, "_push_event_without_waiter", push)
+    manager.begin_round("sess_a", "req_1", terminal_armed=True)
+
+    terminal = {
+        "event_type": "chat.processing_status",
+        "session_id": "sess_a",
+        "rid": 1,
+        "is_processing": False,
+        "is_complete": True,
+    }
+    await manager.broadcast_event("sess_a", terminal, channel_id="web")
+
+    push.assert_awaited_once()
+    pushed_session, pushed_event = push.await_args.args
+    assert pushed_session == "sess_a"
+    assert pushed_event["is_processing"] is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_frame_with_waiters_skips_server_push(monkeypatch):
+    from jiuwenswarm.agents.harness.team import team_manager
+
+    manager = team_manager.TeamManager()
+    monkeypatch.setattr(team_manager, "_team_manager", manager)
+    push = AsyncMock()
+    monkeypatch.setattr(manager, "_push_event_without_waiter", push)
+    manager.begin_round("sess_a", "req_1", terminal_armed=True)
+    queue = asyncio.Queue()
+    manager.add_waiter("sess_a", "req_1", queue)
+
+    terminal = {
+        "event_type": "chat.processing_status",
+        "session_id": "sess_a",
+        "rid": 1,
+        "is_processing": False,
+        "is_complete": True,
+    }
+    await manager.broadcast_event("sess_a", terminal, channel_id="web")
+
+    push.assert_not_awaited()
+    delivered = queue.get_nowait()
+    assert delivered["is_processing"] is False
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_without_waiters_skips_server_push(monkeypatch):
+    from jiuwenswarm.agents.harness.team import team_manager
+
+    manager = team_manager.TeamManager()
+    monkeypatch.setattr(team_manager, "_team_manager", manager)
+    push = AsyncMock()
+    monkeypatch.setattr(manager, "_push_event_without_waiter", push)
+    manager.begin_round("sess_a", "req_1", terminal_armed=True)
+
+    await manager.broadcast_event(
+        "sess_a", {"event_type": "chat.delta", "content": "hi"}, channel_id="web",
+    )
+
+    push.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unarmed_terminal_is_dropped_before_waiterless_fallback(monkeypatch):
+    """The stale-frame guard outranks the fallback: an unarmed terminal never ships."""
+    from jiuwenswarm.agents.harness.team import team_manager
+
+    manager = team_manager.TeamManager()
+    monkeypatch.setattr(team_manager, "_team_manager", manager)
+    push = AsyncMock()
+    monkeypatch.setattr(manager, "_push_event_without_waiter", push)
+    manager.begin_round("sess_a", "req_1", terminal_armed=False)
+
+    terminal = {
+        "event_type": "chat.processing_status",
+        "session_id": "sess_a",
+        "rid": 1,
+        "is_processing": False,
+        "is_complete": True,
+    }
+    await manager.broadcast_event("sess_a", terminal, channel_id="web")
+
+    push.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("event", [
     {"event_type": "chat.tool_call", "tool_call": {"name": "shell"}},
     {"event_type": "chat.ask_user_question"},
@@ -1321,7 +1492,7 @@ async def test_flow_finishing_excludes_subsequent_work(monkeypatch, event):
 
     manager = team_manager.TeamManager()
     monkeypatch.setattr(team_manager, "_team_manager", manager)
-    monkeypatch.setattr(manager, "_push_workflow_event_without_waiter", AsyncMock())
+    monkeypatch.setattr(manager, "_push_event_without_waiter", AsyncMock())
     manager._workflow_handlers["sess_a"] = SimpleNamespace(
         get_run_states=lambda: {"wf_1": SimpleNamespace(is_terminal=True)},
     )
@@ -1352,7 +1523,7 @@ async def test_flow_finishing_waits_for_existing_team_task(monkeypatch, status):
 
     manager = team_manager.TeamManager()
     monkeypatch.setattr(team_manager, "_team_manager", manager)
-    monkeypatch.setattr(manager, "_push_workflow_event_without_waiter", AsyncMock())
+    monkeypatch.setattr(manager, "_push_event_without_waiter", AsyncMock())
     manager._workflow_handlers["sess_a"] = SimpleNamespace(
         get_run_states=lambda: {"wf_1": SimpleNamespace(is_terminal=True)},
     )
@@ -1368,3 +1539,271 @@ async def test_flow_finishing_waits_for_existing_team_task(monkeypatch, status):
         "type": "team.task.updated", "task_id": "task_1", "status": status,
     }})
     assert team_manager.team_round_finishing_after_flow("sess_a")
+
+
+@pytest.mark.asyncio
+async def test_archive_fences_admission_while_flushing_accepted_writes(archive, monkeypatch):
+    service, create, root, _ = archive
+    create()
+    generation = lc.state("session", "sess_a").get("generation", 0)
+    entered, release = threading.Event(), threading.Event()
+
+    def flush(timeout):
+        entered.set()
+        return release.wait(5)
+
+    monkeypatch.setattr(sm, "flush_pending_writes", flush)
+    task = asyncio.create_task(service.session("sess_a", "archive", "web"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        with pytest.raises(lc.LifecycleError) as error:
+            lc.guard("sess_a")
+        assert error.value.code == "OPERATION_IN_PROGRESS"
+        # Accepted writers from before the fence must still drain successfully.
+        lc.write_guard("sess_a", generation)
+        assert (root / "sessions/sess_a").exists()
+    finally:
+        release.set()
+        await task
+    with pytest.raises(lc.LifecycleError) as error:
+        lc.guard("sess_a")
+    assert error.value.code == "SESSION_ARCHIVED"
+
+
+@pytest.mark.asyncio
+async def test_failed_fenced_archive_recovery_restores_admission(archive, monkeypatch):
+    service, create, _, _ = archive
+    create()
+    monkeypatch.setattr(sm, "flush_pending_writes", lambda timeout: False)
+    with pytest.raises(lc.LifecycleError):
+        await service.session("sess_a", "archive", "web")
+    assert lc.state("session", "sess_a")["blocked"]
+    await asyncio.to_thread(
+        service._finalize_abandoned_archive,
+        lc.state("session", "sess_a")["operation"],
+    )
+    lc.guard("sess_a")
+    assert not lc.state("session", "sess_a")["blocked"]
+
+
+@pytest.mark.asyncio
+async def test_delete_stops_heartbeat_instead_of_reporting_busy(archive, monkeypatch):
+    from jiuwenswarm.runtime.service import AgentRuntime
+    from jiuwenswarm.runtime.session import SessionWorkKind
+    from jiuwenswarm.runtime.session.model import SessionExecutionState
+    from jiuwenswarm.agents.harness.code.rails.heartbeat.execution import SessionRunAdmission
+
+    service, create, _, runtime = archive
+    create("heartbeat_run")
+    admission = SessionRunAdmission()
+    cancelled_runs: list[str] = []
+    cancelled_executions: list[str] = []
+    execution = SimpleNamespace(
+        execution_id="exec-heartbeat",
+        work_kind=SessionWorkKind.HEARTBEAT,
+        state=SessionExecutionState.RUNNING,
+    )
+
+    async def cancel_run(run_id):
+        # Releasing the admission marker alone must not be what settles the
+        # session: the coordinator still owns a live heartbeat execution.
+        cancelled_runs.append(run_id)
+        await admission.end_heartbeat("heartbeat_run", run_id)
+        return True
+
+    async def cancel_execution(session_id, *, execution_id=None, **kwargs):
+        cancelled_executions.append(execution_id)
+        execution.state = SessionExecutionState.CANCELLED
+        return SimpleNamespace(matched=1, cancelled=1, timed_out=())
+
+    admission.set_heartbeat_preemptor(cancel_run)
+    probe = SimpleNamespace(
+        _admission_controller=admission,
+        _pending_chat_requests={},
+        _session_coordinator=SimpleNamespace(
+            snapshot_session=lambda sid: SimpleNamespace(executions=(execution,)),
+            cancel_execution=cancel_execution,
+        ),
+    )
+    runtime.is_session_running = lambda sid: AgentRuntime.is_session_running(probe, sid)
+    runtime.has_parked_team_streams = lambda sid: AgentRuntime.has_parked_team_streams(probe, sid)
+    runtime.stop_heartbeat_runs = lambda sid: AgentRuntime.stop_heartbeat_runs(probe, sid)
+    assert await admission.try_begin_heartbeat("heartbeat_run", "run-1")
+    assert admission.is_heartbeat_active("heartbeat_run")
+    assert runtime.is_session_running("heartbeat_run")
+    # A live heartbeat must not turn delete into a busy rejection: the action
+    # stops the run and its execution, then deletes a settled session.
+    assert (await service.session("heartbeat_run", "delete", "web"))["ok"]
+    assert cancelled_runs == ["run-1"]
+    assert cancelled_executions == ["exec-heartbeat"]
+    assert not admission.is_heartbeat_active("heartbeat_run")
+    assert not runtime.is_session_running("heartbeat_run")
+    runtime.delete_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_reports_busy_when_heartbeat_refuses_to_stop(archive, monkeypatch):
+    from jiuwenswarm.runtime.service import AgentRuntime
+    from jiuwenswarm.runtime.session import SessionWorkKind
+    from jiuwenswarm.runtime.session.model import SessionExecutionState
+    from jiuwenswarm.agents.harness.code.rails.heartbeat.execution import SessionRunAdmission
+
+    service, create, _, runtime = archive
+    create("heartbeat_run")
+    admission = SessionRunAdmission()
+    execution = SimpleNamespace(
+        execution_id="exec-heartbeat",
+        work_kind=SessionWorkKind.HEARTBEAT,
+        state=SessionExecutionState.RUNNING,
+    )
+
+    async def refuse(run_id):
+        return False
+
+    admission.set_heartbeat_preemptor(refuse)
+    probe = SimpleNamespace(
+        _admission_controller=admission,
+        _pending_chat_requests={},
+        _session_coordinator=SimpleNamespace(
+            snapshot_session=lambda sid: SimpleNamespace(executions=(execution,)),
+            cancel_execution=AsyncMock(),
+        ),
+    )
+    runtime.is_session_running = lambda sid: AgentRuntime.is_session_running(probe, sid)
+    runtime.has_parked_team_streams = lambda sid: AgentRuntime.has_parked_team_streams(probe, sid)
+    runtime.stop_heartbeat_runs = lambda sid: AgentRuntime.stop_heartbeat_runs(probe, sid)
+    assert await admission.try_begin_heartbeat("heartbeat_run", "run-1")
+    # Stopping failed: the run is still live, so the ordinary busy check must
+    # still keep the session out of deletion.
+    with pytest.raises(lc.LifecycleError) as error:
+        await service.session("heartbeat_run", "delete", "web")
+    assert error.value.code == "SESSION_BUSY"
+    assert admission.is_heartbeat_active("heartbeat_run")
+    runtime.delete_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_archive_releases_subagents_instead_of_reporting_busy(archive):
+    from unittest.mock import Mock
+
+    service, create, _, runtime = archive
+    create("subagent_run")
+    released: list[str] = []
+
+    async def release(session_id, *, channel_id="", reason="session_deleted"):
+        released.append(session_id)
+        # 释放后会话落定：常驻 subagent 不再让 is_session_running 判真。
+        runtime.is_session_running = Mock(return_value=False)
+        return True
+
+    runtime.is_session_running = Mock(return_value=True)
+    runtime.stop_subagent_runtimes = release
+    # A resident subagent must not turn archive into a busy rejection: the
+    # action releases it, then reads a settled session.
+    assert (await service.session("subagent_run", "archive", "web"))["ok"]
+    assert released == ["subagent_run"]
+
+
+@pytest.mark.asyncio
+async def test_busy_details_mark_subagent_finishing(archive):
+    service, create, _, runtime = archive
+    create("subagent_finishing")
+
+    async def release(session_id, *, channel_id="", reason="session_deleted"):
+        return True
+
+    runtime.is_session_running = Mock(return_value=True)
+    runtime.stop_subagent_runtimes = release
+    runtime.is_subagent_finishing = lambda sid, *, channel_id="": True
+    with pytest.raises(lc.LifecycleError) as error:
+        await service.session("subagent_finishing", "delete", "web")
+    assert error.value.code == "SESSION_BUSY"
+    # 已被要求停止、仍在收尾：前端走"稍后重试"文案，而不是让用户去停止一个
+    # 已经停过的会话。
+    assert error.value.details["finishing"] is True
+    assert error.value.details["subagent_finishing"] is True
+    assert "请稍后重试" in str(error.value)
+    runtime.delete_session.assert_not_awaited()
+
+
+def _subagent_agent(owns, released):
+    """Build a channel Agent whose adapter records subagent releases."""
+    adapter = SimpleNamespace(apply_sandbox_runtime_patch=True)
+
+    async def release_runtime(session_id, *, reason="session_deleted"):
+        released.append((session_id, reason))
+
+    adapter.release_subagent_runtime_for_session = release_runtime
+    adapter._session_has_live_subagents = lambda sid: sid in owns
+    return SimpleNamespace(
+        _adapter=adapter,
+        has_session_runtime=lambda sid: sid in owns,
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_release_targets_the_agent_owning_the_session():
+    from jiuwenswarm.server.runtime.agent_manager import AgentManager
+
+    manager = AgentManager()
+    other_released: list[tuple[str, str]] = []
+    owner_released: list[tuple[str, str]] = []
+    # A channel caches one Agent per project and mode, and subagent controls
+    # are held per Agent, so the first match is usually the wrong one.
+    manager.agents["web"] = {
+        "other-project": _subagent_agent(set(), other_released),
+        "this-project": _subagent_agent({"sess_a"}, owner_released),
+    }
+    assert await manager.release_subagent_runtime_for_session(
+        channel_id="web", session_id="sess_a", reason="session_archived"
+    )
+    # Releasing against the first Agent cancels nothing and leaves the
+    # resident subagents running.
+    assert other_released == []
+    assert owner_released == [("sess_a", "session_archived")]
+    assert manager.session_has_live_subagents(channel_id="web", session_id="sess_a")
+
+
+@pytest.mark.asyncio
+async def test_subagent_release_falls_back_to_channel_agent_without_owner():
+    from jiuwenswarm.server.runtime.agent_manager import AgentManager
+
+    manager = AgentManager()
+    released: list[tuple[str, str]] = []
+    manager.agents["web"] = {"only": _subagent_agent(set(), released)}
+    # No Agent claims the Session runtime (already torn down, or never bound);
+    # the release still runs rather than being skipped.
+    assert await manager.release_subagent_runtime_for_session(
+        channel_id="web", session_id="sess_gone"
+    )
+    assert released == [("sess_gone", "session_deleted")]
+
+
+@pytest.mark.asyncio
+async def test_archive_releases_subagents_through_the_session_own_channel(archive):
+    service, create, _, runtime = archive
+    directory = create("cli_subagent")
+    lc.atomic_json(
+        directory / "metadata.json",
+        dict(
+            session_id="cli_subagent",
+            channel_id="cli",
+            title="cli_subagent",
+            work_mode="work",
+            project_id="default",
+        ),
+    )
+    sm._METADATA_CACHE.clear()
+    seen: list[str] = []
+
+    async def release(session_id, *, channel_id="", reason="session_deleted"):
+        seen.append(channel_id)
+        runtime.is_session_running = Mock(return_value=False)
+        return True
+
+    runtime.is_session_running = Mock(return_value=True)
+    runtime.stop_subagent_runtimes = release
+    assert (await service.session("cli_subagent", "archive", "web"))["ok"]
+    # Agents are cached per channel, so the release has to reach the Session's
+    # own channel rather than the one serving this request.
+    assert seen == ["cli"]

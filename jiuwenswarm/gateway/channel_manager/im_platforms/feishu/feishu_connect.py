@@ -107,6 +107,86 @@ MSG_TYPE_MAP = {
 }
 
 
+
+def _extract_feishu_post_text(content: str) -> str:
+    """Parse Feishu rich-text (post) message JSON into plain text.
+
+    Supports both the flat shape ``{"title", "content"}`` and the locale-wrapped
+    shape ``{"zh_cn": {...}, "en_us": {...}}`` (zh_cn preferred). On parse failure
+    returns a clear placeholder instead of silently dropping the body.
+    """
+    try:
+        data = json.loads(content) if isinstance(content, str) else (content or {})
+    except (json.JSONDecodeError, TypeError):
+        return "[富文本消息解析失败]"
+
+    if not isinstance(data, dict):
+        return "[富文本消息解析失败]"
+
+    # Locale-wrapped payload: prefer zh_cn, then en_us, then first dict with content/title
+    if "content" not in data:
+        post = None
+        for key in ("zh_cn", "en_us"):
+            cand = data.get(key)
+            if isinstance(cand, dict) and ("content" in cand or "title" in cand):
+                post = cand
+                break
+        if post is None:
+            for cand in data.values():
+                if isinstance(cand, dict) and ("content" in cand or "title" in cand):
+                    post = cand
+                    break
+        if post is not None:
+            data = post
+
+    parts: list[str] = []
+    title = data.get("title") or ""
+    if isinstance(title, str) and title.strip():
+        parts.append(title.strip())
+
+    content_blocks = data.get("content") or []
+    if isinstance(content_blocks, list):
+        for paragraph in content_blocks:
+            if not isinstance(paragraph, list):
+                continue
+            line_bits: list[str] = []
+            for node in paragraph:
+                if not isinstance(node, dict):
+                    continue
+                tag = node.get("tag")
+                if tag in ("text", "at", "email"):
+                    t = node.get("text") or ""
+                    if t:
+                        line_bits.append(str(t))
+                elif tag == "a":
+                    t = node.get("text") or ""
+                    href = node.get("href") or ""
+                    if t and href:
+                        line_bits.append(f"{t}({href})")
+                    elif t:
+                        line_bits.append(str(t))
+                    elif href:
+                        line_bits.append(str(href))
+                elif tag == "img":
+                    line_bits.append("[图片]")
+                elif tag == "media":
+                    line_bits.append("[视频]")
+                elif tag == "emotion":
+                    emoji = node.get("emoji_type") or node.get("text") or ""
+                    if emoji:
+                        line_bits.append(str(emoji))
+                else:
+                    t = node.get("text")
+                    if t:
+                        line_bits.append(str(t))
+            if line_bits:
+                parts.append("".join(line_bits))
+
+    result = "\n".join(parts).strip()
+    return result if result else "[富文本消息解析失败]"
+
+
+
 class _ThreadLocalLoopProxy:
     """Provide a thread-local event loop proxy for lark_oapi ws client."""
 
@@ -204,6 +284,8 @@ class FeishuChannel(BaseChannel):
         self._stopping = False
         # 按 request_id 聚合 chat.delta，避免同一任务被拆分成多条消息发送到飞书。
         self._stream_text_buffers: dict[str, str] = {}
+        # 已经发过 chat.error 的请求：结束时不再补一句"[状态] 已完成"，避免看起来像是成功了
+        self._errored_stream_keys: set[str] = set()
         self._cardkit_sessions: dict[str, FeishuStreamingSession] = {}
         self._cardkit_buffers: dict[str, str] = {}
         self._cardkit_lock = asyncio.Lock()
@@ -576,6 +658,7 @@ class FeishuChannel(BaseChannel):
         self._running = False
         self._stopping = True
         self._stream_text_buffers.clear()
+        self._errored_stream_keys.clear()
         for session in list(self._cardkit_sessions.values()):
             try:
                 await session.finalize()
@@ -1647,9 +1730,13 @@ class FeishuChannel(BaseChannel):
                         return
                 else:
                     content_str = self._stream_text_buffers.pop(stream_key, "")
+                    errored = stream_key in self._errored_stream_keys
+                    self._errored_stream_keys.discard(stream_key)
                     if not content_str.strip():
                         if not streaming_enabled:
                             await self._handle_processing_status_event(msg, meta, payload)
+                            return
+                        if errored:
                             return
                         content_str = self._extract_message_content(msg)
                         if not content_str.strip():
@@ -1660,6 +1747,8 @@ class FeishuChannel(BaseChannel):
                     buffered_text = self._stream_text_buffers.pop(stream_key, "")
                 elif event_name in {"chat.error", "chat.interrupt_result"}:
                     self._stream_text_buffers.pop(stream_key, None)
+                    if event_name == "chat.error" and stream_key:
+                        self._errored_stream_keys.add(stream_key)
                 content_str = self._extract_message_content(msg)
                 is_complete = msg.payload.get("is_complete", False)
                 if is_complete:
@@ -3024,8 +3113,9 @@ class FeishuChannel(BaseChannel):
                 return text
             except json.JSONDecodeError:
                 return message.content or ""
-        else:
-            return MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
+        if msg_type == "post":
+            return _extract_feishu_post_text(message.content or "")
+        return MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 
     async def _parse_message_content_with_file(
         self,
@@ -3070,6 +3160,10 @@ class FeishuChannel(BaseChannel):
         # 视频/媒体消息
         if msg_type == "media":
             return await self._handle_media_message(message)
+
+        # 富文本 (post) 消息：解析正文，避免落到 [post] 占位符
+        if msg_type == "post":
+            return _extract_feishu_post_text(message.content or ""), None
 
         # 贴纸消息
         if msg_type == "sticker":
