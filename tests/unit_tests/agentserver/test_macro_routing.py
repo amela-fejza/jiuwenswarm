@@ -85,6 +85,18 @@ async def test_auto_rules_simple_fix_stays_agent():
     assert decision.source == "rules"
 
 
+def test_gate_tie_prefers_agent():
+    decision = route_with_gate(
+        "alpha beta gamma delta",
+        config={
+            "team_markers": ["alpha", "beta"],
+            "fast_markers": ["gamma", "delta"],
+        },
+    )
+    assert decision.features["scores"] == {"team": 4.0, "agent": 4.0}
+    assert decision.mode == "agent"
+
+
 def test_gate_ambiguous_defaults_to_agent():
     decision = route_with_gate("What do you think about this overall?")
     assert decision.mode == "agent"

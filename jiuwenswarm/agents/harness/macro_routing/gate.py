@@ -106,7 +106,9 @@ def route_with_gate(
         "agent": agent_score,
     }
     features["scores"] = dict(scores)
-    best_mode = max(scores, key=scores.get)
+    # max() would return "team" on a tie because it is the first inserted key.
+    # A tie should stay on Agent: a mistaken Cluster is the more expensive miss.
+    best_mode = "team" if team_score > agent_score else "agent"
     best = scores.get(best_mode, 0.0)
     second = sorted(scores.values(), reverse=True)[1] if len(scores) > 1 else 0.0
     margin = best - second
