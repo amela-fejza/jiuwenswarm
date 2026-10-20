@@ -90,7 +90,7 @@ from jiuwenswarm.common.utils import (
 )
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
 from jiuwenswarm.common.schema.message import ReqMethod, Message, Mode
-from jiuwenswarm.gateway.embedded.runtime.attachments.media_attachments import (
+from jiuwenswarm.gateway.channel_manager.web.media import (
     normalize_chat_media_attachments,
 )
 _mark_startup_import_phase("gateway_core_imports_loaded")
@@ -1933,7 +1933,7 @@ async def _run(
 
     cron_store = await create_gateway_cron_store()
     from jiuwenswarm.common.model_migration import migrate_legacy_cron_selections
-    from jiuwenswarm.runtime.cron.factory import load_cron_store_settings
+    from jiuwenswarm.gateway.runtime.cron.factory import load_cron_store_settings
 
     # Shared etcd jobs need the target user's catalog; that migration runs on
     # the per-user resource/reference boundary, never using Gateway's catalog.
@@ -1972,7 +1972,7 @@ async def _run(
     from jiuwenswarm.gateway.routing.e2a_proxy import is_agentos_routing_client
     if is_agentos_routing_client(client):
         from jiuwenswarm.extensions.agentos.config_updater.service import ConfigUpdaterService
-        from jiuwenswarm.runtime.cron.factory import load_cron_store_settings
+        from jiuwenswarm.gateway.runtime.cron.factory import load_cron_store_settings
 
         config_updater = ConfigUpdaterService(
             etcd_endpoints=list(load_cron_store_settings(full_cfg).endpoints),
@@ -2303,10 +2303,16 @@ async def _run(
         )
     )
 
+    async def _media_normalizer(params: dict[str, Any], session_id: str | None) -> None:
+        # A1g：小图落盘经 E2A 到 AgentServer，闭包捕获启动装配的 client
+        await normalize_chat_media_attachments(
+            params, session_id, agent_client=client, user_id=None
+        )
+
     extension_registry.bind_application_plugins(
         web_channel,
         agent_client=client,
-        media_attachment_normalizer=normalize_chat_media_attachments,
+        media_attachment_normalizer=_media_normalizer,
     )
     log_startup_stage("web_handlers_registered")
 

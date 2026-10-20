@@ -75,6 +75,13 @@
     "loadErrorTitle": "Failed to load",
     "loadErrorFallback": "Could not load the design workflow. Please try again later.",
     "attachmentsBlocked": "Design mode does not support attachments yet. Remove attachments and try again.",
+    "models": {
+      "chatMissing": "Chat model is not configured. Configure a model in Settings before using Design.",
+      "videoOff": "Video generation is switched off in Settings > Agent.",
+      "videoMissing": "Video generation is not configured: set the API URL, API key and model in Settings > Agent.",
+      "imageOff": "Image generation is switched off in Settings > Agent.",
+      "imageMissing": "Image generation is not configured: set the API URL, API key and model in Settings > Agent."
+    },
     "activity": {
       "thinking": "Thinking",
       "toolCall": "Using {{tool}}",
@@ -1451,8 +1458,7 @@
       "empty": "No models available. Add a model in Settings first.",
       "placeholder": "Select Model",
       "selectOrdinaryModel": "Select an individual model",
-      "collaborationDisabled": "Multi-model collaboration is off. Select an individual model before sending.",
-      "noModelGroups": "No model groups yet. Create one in Settings."
+      "collaborationDisabled": "Multi-model collaboration is off. Select an individual model before sending."
     },
     "contextUsage": {
       "title": "Context usage",
@@ -2005,7 +2011,9 @@
       "useBuiltin": "Use built-in CLI",
       "detect": "Detect",
       "toggleEnable": "Enable/disable {{agent}}",
-      "detectHint": "Leave the path empty to search the system PATH, or enter a CLI executable path to validate it and check its version",
+      "detectHint": "Validate the CLI executable and check its version; leave the path empty to search the system PATH",
+      "redetectHint": "Re-check the current CLI executable and validate its version",
+      "installSucceeded": "Install completed",
       "selectFile": "Choose file",
       "selectFileTitle": "Choose {{agent}} command",
       "selectFileFailed": "Failed to choose file",
@@ -3420,7 +3428,8 @@
       "updating": "Saving…"
     },
     "confirm": {
-      "deleteMessage": "Delete the Expert “{{name}}”? This cannot be undone."
+      "deleteMessage": "Delete the Expert “{{name}}”? This cannot be undone.",
+      "uninstallGroupMessage": "Uninstall the Expert Team “{{name}}”?"
     },
     "card": {
       "open": "Open {{name}} details",
@@ -3607,7 +3616,7 @@
         "membersInvalid": "The Expert Team members are invalid. Choose a leader and distinct members.",
         "memberUnavailable": "A selected Expert is unavailable or not Team-compatible.",
         "packageValidationError": "Expert Team package validation failed: {{reason}}",
-        "createSuccess": "Expert Team package {{id}} was created.",
+        "createSuccess": "Expert Team \"{{name}}\" was created.",
         "uploadSuccess": "Expert Team package {{id}} was imported. Review it in My Expert Teams.",
         "uploadError": "Unable to import the Expert Team package. Check the file and try again.",
         "catalogEmpty": "No Expert Teams to show",

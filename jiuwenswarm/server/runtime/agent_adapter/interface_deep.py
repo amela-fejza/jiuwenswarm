@@ -1843,6 +1843,7 @@ class JiuWenSwarmDeepAdapter:
         self._model_request_config: ModelRequestConfig | None = None
         self._last_resolved_model: Model | None = None
         self._active_request_model: Model | None = None
+        self._context_model_binding: tuple[Any, Model, tuple[Any, ...]] | None = None
         self._selected_model_context_window_tokens: int | None = None
         self._config_base_cache: dict[str, Any] | None = None
         self._config_cache: dict[str, Any] = {}
@@ -8285,8 +8286,22 @@ class JiuWenSwarmDeepAdapter:
                 config.context_engine_config = context_config
                 context_engine = getattr(react_agent, "context_engine", None)
                 rebind_context_model = getattr(context_engine, "rebind_context_model", None)
+                binding = (
+                    context_config.model_dump(mode="python"),
+                    model.model_config.model_dump(mode="python"),
+                    model.model_client_config.model_dump(mode="python"),
+                    session_id,
+                )
+                previous_binding = getattr(self, "_context_model_binding", None)
+                unchanged = (
+                    previous_binding is not None
+                    and previous_binding[0] is context_engine
+                    and previous_binding[1] is model
+                    and previous_binding[2] == binding
+                )
                 rebound = 0
-                if callable(rebind_context_model):
+                if callable(rebind_context_model) and not unchanged:
+                    self._context_model_binding = None
                     rebound = rebind_context_model(
                         context_config,
                         session_id=session_id,
@@ -8294,7 +8309,12 @@ class JiuWenSwarmDeepAdapter:
                         model_config=model.model_config,
                         model_client_config=model.model_client_config,
                     )
-                logger.info(
+                    # Zero also means the contexts already match, or none have
+                    # been created yet. New contexts use the published config.
+                    # A partial failure must also invalidate the old snapshot.
+                    self._context_model_binding = (context_engine, model, binding)
+                log_binding = logger.debug if unchanged else logger.info
+                log_binding(
                     "[JiuWenSwarmDeepAdapter] synchronized context model=%s provider=%s "
                     "session_id=%s rebound_contexts=%s",
                     context_config.model_name,
@@ -10845,8 +10865,7 @@ class JiuWenSwarmDeepAdapter:
             compose_host_effective_permissions,
         )
         from jiuwenswarm.agents.harness.common.rails.permissions.permissions_layers import (
-            load_session_permissions,
-            load_user_permissions,
+            permission_storage_lock, read_permission_layers_locked,
         )
 
         permission_config = config_base.get("permissions", {}) if config_base else {}
@@ -10862,15 +10881,27 @@ class JiuWenSwarmDeepAdapter:
             return
         if self._permission_rail is not None:
             replacer = getattr(self._permission_rail, "replace_installed_global_permissions", None)
-            if callable(replacer):
-                replacer(copy.deepcopy(permission_config))
-            effective = compose_host_effective_permissions(
-                global_permissions=permission_config,
-                user_permissions=load_user_permissions(),
-                session_permissions=load_session_permissions(session_id),
-                session_id=session_id,
+            previous_global = replacer(copy.deepcopy(permission_config)) if callable(replacer) else None
+            from jiuwenswarm.agents.harness.common.rails.permissions.auto_permission_rail import (
+                AutoPermissionInterruptRail,
             )
-            self._permission_rail.update_config(effective)
+            try:
+                with permission_storage_lock(session_id):
+                    _, user, session = read_permission_layers_locked(
+                        session_id, global_permissions=permission_config,
+                    )
+                    effective = compose_host_effective_permissions(
+                        global_permissions=permission_config,
+                        user_permissions=user,
+                        session_permissions=session,
+                        session_id=session_id,
+                        auto_mode=isinstance(self._permission_rail, AutoPermissionInterruptRail),
+                    )
+                self._permission_rail.update_config(effective)
+            except BaseException:
+                if callable(replacer):
+                    replacer(previous_global)
+                raise
             logger.info("[JiuWenSwarmDeepAdapter] _permission_rail config hot-updated")
         elif enabled:
             self._permission_rail = build_permission_rail(
@@ -10967,7 +10998,7 @@ class JiuWenSwarmDeepAdapter:
         }
 
     def _capture_permission_version(self) -> tuple[str, dict[str, Any], dict[str, Any]]:
-        """Capture D from the storage owner, including overlay-only changes."""
+        """Capture graph authority; User/Session overlays refresh per tool call."""
         from jiuwenswarm.agents.harness.common.rails.permissions.permissions_layers import (
             capture_permission_layers,
         )
@@ -10981,6 +11012,7 @@ class JiuWenSwarmDeepAdapter:
         effective = compose_host_effective_permissions(
             global_permissions=layers[0], user_permissions=layers[1],
             session_permissions=layers[2], session_id=sid,
+            auto_mode=is_auto_permission_enabled(layers[0]),
         )
         epoch = self._stable_reload_fingerprint({
             "session_id": sid,
@@ -10989,7 +11021,7 @@ class JiuWenSwarmDeepAdapter:
                 if is_auto_permission_enabled(layers[0]) and self._auto_permission_capability_enabled()
                 else self._permission_workspace_root
             ),
-            "layers": layers,
+            "global": layers[0],
         })
         return epoch, layers[0], effective
 

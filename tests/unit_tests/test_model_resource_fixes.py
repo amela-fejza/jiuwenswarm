@@ -373,7 +373,10 @@ async def test_reference_check_fails_closed_on_store_error(catalog_state, monkey
     from jiuwenswarm.common.config_panel.model_resource_handlers import find_resource_references
 
     store = SimpleNamespace(list_jobs=AsyncMock(side_effect=RuntimeError("etcd unavailable")), aclose=AsyncMock())
-    monkeypatch.setattr("jiuwenswarm.runtime.cron.factory.create_gateway_cron_store", AsyncMock(return_value=store))
+    from types import SimpleNamespace as _NS
+
+    from jiuwenswarm.common.external_providers import register
+    register("cron_store_factory", _NS(create_gateway_cron_store=AsyncMock(return_value=store)))
     with pytest.raises(RuntimeError, match="etcd unavailable"):
         await find_resource_references(ModelCatalog(catalog_state), ModelSelection(type="model", id="mdl_a"))
     store.aclose.assert_awaited_once()
@@ -393,13 +396,26 @@ def test_resource_delete_ignores_session_references(catalog_state, monkeypatch):
     assert [entry["model_id"] for entry in catalog_state["models"]["defaults"]] == ["mdl_b"]
 
 
-def test_delete_keeps_model_group_routes_valid(catalog_state):
+def test_delete_model_prunes_group_routes_instead_of_failing(catalog_state):
     catalog_state["models"]["groups"] = [{
-        "model_group_id": "mgp_a", "routes": [{"route_id": "rte_a", "model_id": "mdl_a"}],
+        "model_group_id": "mgp_a",
+        "display_name": "Coding Pool",
+        "routes": [
+            {"route_id": "rte_a", "model_id": "mdl_a"},
+            {"route_id": "rte_b", "model_id": "mdl_b"},
+        ],
+    }, {
+        "model_group_id": "mgp_only_a",
+        "display_name": "Solo",
+        "routes": [{"route_id": "rte_c", "model_id": "mdl_a"}],
     }]
-    with pytest.raises(ModelSelectionError, match="references missing model_id"):
-        config_module.delete_model_resource("model", "mdl_a")
-    assert len(catalog_state["models"]["defaults"]) == 2
+    assert config_module.delete_model_resource("model", "mdl_a")
+    assert [entry["model_id"] for entry in catalog_state["models"]["defaults"]] == ["mdl_b"]
+    assert catalog_state["models"]["groups"] == [{
+        "model_group_id": "mgp_a",
+        "display_name": "Coding Pool",
+        "routes": [{"route_id": "rte_b", "model_id": "mdl_b"}],
+    }]
 
 
 def test_deleted_session_selection_uses_current_default(catalog_state, monkeypatch):

@@ -75,6 +75,13 @@
     "loadErrorTitle": "加载失败",
     "loadErrorFallback": "无法读取设计工作流，请稍后重试。",
     "attachmentsBlocked": "设计模式暂不支持附件，请先移除附件后再发送。",
+    "models": {
+      "chatMissing": "对话模型未配置，请先在「设置」中配置模型后再使用设计。",
+      "videoOff": "视频生成已在「设置 > Agent」中关闭。",
+      "videoMissing": "视频生成未配置：请在「设置 > Agent」中填写 API 地址、API 密钥和模型名称。",
+      "imageOff": "图像生成已在「设置 > Agent」中关闭。",
+      "imageMissing": "图像生成未配置：请在「设置 > Agent」中填写 API 地址、API 密钥和模型名称。"
+    },
     "activity": {
       "thinking": "思考中",
       "toolCall": "正在调用 {{tool}}",
@@ -1435,8 +1442,7 @@
       "empty": "暂无可用模型，请先在设置中添加模型",
       "placeholder": "选择模型",
       "selectOrdinaryModel": "请选择普通模型",
-      "collaborationDisabled": "多模型协同已关闭，请选择普通模型后发送。",
-      "noModelGroups": "尚无模型组，前往设置创建模型组。"
+      "collaborationDisabled": "多模型协同已关闭，请选择普通模型后发送。"
     },
     "contextUsage": {
       "title": "上下文用量",
@@ -1989,7 +1995,9 @@
       "useBuiltin": "使用内置 CLI",
       "detect": "检测",
       "toggleEnable": "启用/禁用 {{agent}}",
-      "detectHint": "未填写路径时从系统 PATH 查找；填写路径后检测指定的 CLI 可执行文件并校验版本",
+      "detectHint": "检测 CLI 可执行文件并校验版本；未填写路径时从系统 PATH 查找",
+      "redetectHint": "重新检测当前 CLI 可执行文件并校验版本",
+      "installSucceeded": "安装完成",
       "selectFile": "选择文件",
       "selectFileTitle": "选择 {{agent}} 命令",
       "selectFileFailed": "选择文件失败",
@@ -3404,7 +3412,8 @@
       "updating": "保存中…"
     },
     "confirm": {
-      "deleteMessage": "确定要删除专家「{{name}}」吗？此操作不可恢复。"
+      "deleteMessage": "确定要删除专家「{{name}}」吗？此操作不可恢复。",
+      "uninstallGroupMessage": "确定要卸载专家团「{{name}}」吗？"
     },
     "card": { "open": "查看 {{name}} 详情", "actions": "{{name}} 操作", "moreTagsTooltip": "更多标签：{{tags}}" },
     "states": {
@@ -3587,7 +3596,7 @@
         "membersInvalid": "专家团成员信息无效，请选择唯一的负责人和成员。",
         "memberUnavailable": "所选专家不可用或不兼容团队。",
         "packageValidationError": "专家团包校验失败：{{reason}}",
-        "createSuccess": "专家团包 {{id}} 已创建。",
+        "createSuccess": "专家团「{{name}}」已创建。",
         "uploadSuccess": "专家团包 {{id}} 已导入，请在我的专家团中查看。",
         "uploadError": "专家团包导入失败，请检查文件后重试。",
         "catalogEmpty": "暂无可展示的专家团",
