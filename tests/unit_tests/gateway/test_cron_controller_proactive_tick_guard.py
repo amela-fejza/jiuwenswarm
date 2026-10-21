@@ -56,7 +56,9 @@ async def test_create_job_rejects_proactive_tick_mode(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_create_job_allows_auto_registered_proactive_tick_job(tmp_path):
+async def test_create_job_allows_auto_registered_proactive_tick_job(
+    tmp_path,
+):
     """proactive_cron_sync 的固定 id 注册不受影响（内部路径唯一合法入口）。"""
     controller, store = _make_controller(tmp_path)
 
