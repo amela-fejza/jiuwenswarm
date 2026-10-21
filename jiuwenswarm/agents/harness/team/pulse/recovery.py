@@ -42,7 +42,8 @@ class RecoveryStrategy(Protocol):
 class DeterministicRecovery:
     """Explainable rules backed by native task rows."""
 
-    def propose(self, conflict: Conflict, snapshot: CoordinationSnapshot) -> Decision:
+    @staticmethod
+    def propose(conflict: Conflict, snapshot: CoordinationSnapshot) -> Decision:
         if conflict.conflict_type == STALE_OWNERSHIP:
             return Decision(
                 kind=DecisionKind.RECONCILE,

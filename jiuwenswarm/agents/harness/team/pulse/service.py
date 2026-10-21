@@ -17,7 +17,6 @@ from typing import Any, Protocol
 from openjiuwen.agent_teams.context import get_session_id, reset_session_id, set_session_id
 
 from jiuwenswarm.agents.harness.team.handlers.base_monitor_handler import (
-    DropOldestQueue,
     monitor_team_agent,
 )
 from jiuwenswarm.agents.harness.team.pulse.invariants import detect_conflicts
@@ -114,6 +113,7 @@ class TeamPulseService:
         self._applied: set[str] = set()
         self._monitor: Any = None
         self._task: asyncio.Task | None = None
+        self._workflow_task: asyncio.Task | None = None
 
     @property
     def session_id(self) -> str:
@@ -147,8 +147,11 @@ class TeamPulseService:
         if self.is_running:
             return
         self._monitor = monitor
-        _bound_unused_workflow_queue(monitor)
         await monitor.start()
+        self._workflow_task = asyncio.create_task(
+            self._discard_workflow_events(),
+            name=f"teampulse-workflow-{self._session_id}",
+        )
         self._task = asyncio.create_task(
             self._consume(),
             name=f"teampulse-{self._session_id}",
@@ -157,7 +160,9 @@ class TeamPulseService:
     async def stop(self) -> None:
         """Stop the monitor and the consume task. Safe to call twice."""
         task = self._task
+        workflow_task = self._workflow_task
         self._task = None
+        self._workflow_task = None
         monitor = self._monitor
         if monitor is not None:
             try:
@@ -168,18 +173,8 @@ class TeamPulseService:
                     self._session_id,
                     exc,
                 )
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                logger.warning(
-                    "teampulse.conflict session_id=%s consume stop failed: %s",
-                    self._session_id,
-                    exc,
-                )
+        await self._finish_task(task, "consume")
+        await self._finish_task(workflow_task, "workflow drain")
 
     async def handle_event(self, event: Any) -> list[JournalEntry]:
         """Fold one monitor event and scan when it carries coordination state."""
@@ -230,12 +225,44 @@ class TeamPulseService:
                         self._session_id,
                         exc,
                     )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             logger.warning(
                 "teampulse.conflict session_id=%s event stream failed: %s",
                 self._session_id,
+                exc,
+            )
+
+    async def _discard_workflow_events(self) -> None:
+        """Read the public workflow stream so its queue does not grow unused."""
+        monitor = self._monitor
+        if monitor is None:
+            return
+        stream = getattr(monitor, "workflow_events", None)
+        if not callable(stream):
+            return
+        try:
+            async for _event in stream():
+                continue
+        except Exception as exc:
+            logger.warning(
+                "teampulse.conflict session_id=%s workflow drain failed: %s",
+                self._session_id,
+                exc,
+            )
+
+    async def _finish_task(self, task: asyncio.Task | None, label: str) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "teampulse.conflict session_id=%s %s stop failed: %s",
+                self._session_id,
+                label,
                 exc,
             )
 
@@ -398,21 +425,3 @@ class _SessionBind:
 
 def _bound_monitor_session(monitor: Any) -> _SessionBind:
     return _SessionBind(monitor)
-
-
-def _bound_unused_workflow_queue(monitor: Any) -> None:
-    """Keep the unread workflow queue from growing for the whole session.
-
-    TeamPulse consumes ``events()`` only. ``TeamMonitor`` also enqueues
-    workflow events on a second unbounded queue.
-    """
-    source_queue = getattr(monitor, "_workflow_event_queue", None)
-    if not isinstance(source_queue, asyncio.Queue) or source_queue.maxsize > 0:
-        return
-    bounded_queue = DropOldestQueue()
-    while True:
-        try:
-            bounded_queue.put_nowait(source_queue.get_nowait())
-        except asyncio.QueueEmpty:
-            break
-    monitor._workflow_event_queue = bounded_queue
