@@ -1,5 +1,3 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-
 /** Team member navigation using the native trajectory overview and ledger. */
 
 import { memo, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
@@ -27,18 +25,38 @@ export interface TeamTrajectoryWorkspaceProps {
   onSelectSubject: (subjectId: string | null) => void;
   /** Render one native overview, plus its ledger when the member is expanded. */
   memberView: (subjectId: string, context: TeamMemberViewContext) => ReactNode;
+  /** Hide the duration and token switches. Diagnosis locks every lane to wall-clock time. */
+  showScaleControls?: boolean;
+  /** Drop the workspace toolbar when the host draws its own. */
+  hideToolbar?: boolean;
+  /** Host-owned scale and fold state. Replaces the toolbar's own switches. */
+  externalViewState?: TrajectoryViewState;
+  /** Full-width control under the toolbar, used by the diagnosis time axis. */
+  toolbarTrailing?: ReactNode;
+  /** Per-agent inclusion checkboxes. Absent on the raw team trajectory. */
+  agentSelection?: {
+    isIncluded: (subjectId: string) => boolean;
+    onToggle: (subjectId: string) => void;
+    /** Checked agents that currently own a time window. */
+    isHighlighted?: (subjectId: string) => boolean;
+  };
 }
 
 function MemberToolbarControl({
   lane,
   expanded,
   onClick,
+  included,
+  onToggleIncluded,
 }: {
   lane: TeamMemberLaneModel;
   expanded: boolean;
   onClick: () => void;
+  included?: boolean;
+  onToggleIncluded?: () => void;
 }) {
-  return (
+  const { t } = useTranslation();
+  const button = (
     <button
       type="button"
       className={css.memberControl}
@@ -49,9 +67,24 @@ function MemberToolbarControl({
       onClick={onClick}
     >
       <span className={`${css.statusDot} ${css[`status_${lane.status}`]}`} aria-hidden="true" />
-      <span className={css.memberName}>{lane.label}</span>
+      <span className={css.memberName} title={lane.label}>{lane.label}</span>
       <span className={css.chevron} aria-hidden="true">{expanded ? '▾' : '▸'}</span>
     </button>
+  );
+  if (onToggleIncluded === undefined) return button;
+  return (
+    <span className={css.memberCluster}>
+      <input
+        type="checkbox"
+        className={css.memberCheck}
+        checked={included === true}
+        aria-label={t('trajectory.diagnosis.includeAgent', { name: lane.label })}
+        data-testid="trajectory-analysis-agent-checkbox"
+        data-variant={lane.subjectId}
+        onChange={() => onToggleIncluded()}
+      />
+      {button}
+    </span>
   );
 }
 
@@ -67,6 +100,11 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
   selectedSubjectId,
   onSelectSubject,
   memberView,
+  showScaleControls = true,
+  hideToolbar = false,
+  externalViewState,
+  toolbarTrailing,
+  agentSelection,
 }: TeamTrajectoryWorkspaceProps) {
   const { t } = useTranslation();
   const lanes = buildTeamMemberLanes(groups.groups);
@@ -78,7 +116,8 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
   const [callsCollapsed, setCallsCollapsed] = useState(false);
   const lanesRef = useRef<HTMLDivElement>(null);
   const laneRowsRef = useRef(new Map<string, HTMLDivElement>());
-  const viewState = useMemo<TrajectoryViewState>(() => ({
+  const [pinToken, setPinToken] = useState(0);
+  const localViewState = useMemo<TrajectoryViewState>(() => ({
     actualDuration,
     actualTime,
     tokenView,
@@ -91,6 +130,7 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
     tokenView,
     turnsCollapsed,
   ]);
+  const viewState = externalViewState ?? localViewState;
   useLayoutEffect(() => {
     if (selectedSubjectId === null) return;
     const lanesElement = lanesRef.current;
@@ -99,7 +139,7 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
     const lanesBounds = lanesElement.getBoundingClientRect();
     const rowBounds = rowElement.getBoundingClientRect();
     lanesElement.scrollTop += rowBounds.top - lanesBounds.top;
-  }, [selectedSubjectId]);
+  }, [pinToken, selectedSubjectId]);
 
   return (
     <div
@@ -108,8 +148,9 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
       data-trajectory-theme="light"
       data-testid="team-trajectory-workspace"
     >
-      <TrajectoryToolbar
+      {hideToolbar ? null : <TrajectoryToolbar
         showSearch={false}
+        showScaleControls={showScaleControls}
         actualDuration={actualDuration}
         onActualDurationChange={(value) => {
           setActualDuration(value);
@@ -126,7 +167,8 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
         searchQuery=""
         onSearchQueryChange={() => {}}
         t={translate}
-      />
+      />}
+      {toolbarTrailing}
       <div
         ref={lanesRef}
         className={css.lanes}
@@ -139,6 +181,8 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
           const select = () => onSelectSubject(expanded ? null : lane.subjectId);
           const expand = () => {
             if (!expanded) onSelectSubject(lane.subjectId);
+            // Keep this agent's name on screen each time one of its bars is opened.
+            setPinToken(value => value + 1);
           };
           return (
             <div
@@ -150,13 +194,24 @@ export const TeamTrajectoryWorkspace = memo(function TeamTrajectoryWorkspace({
               role="listitem"
               className={`${css.laneRow} ${expanded ? css.laneRowExpanded : ''}`}
               data-member-subject={lane.subjectId}
+              data-highlighted={agentSelection?.isHighlighted?.(lane.subjectId) === true ? 'true' : 'false'}
               data-testid="team-trajectory-lane-row"
             >
               {memberView(lane.subjectId, {
                 expanded,
                 viewState,
                 toolbarAddon: (
-                  <MemberToolbarControl lane={lane} expanded={expanded} onClick={select} />
+                  <MemberToolbarControl
+                    lane={lane}
+                    expanded={expanded}
+                    onClick={select}
+                    {...(agentSelection === undefined
+                      ? {}
+                      : {
+                        included: agentSelection.isIncluded(lane.subjectId),
+                        onToggleIncluded: () => agentSelection.onToggle(lane.subjectId),
+                      })}
+                  />
                 ),
                 onOverviewActivate: expand,
               })}

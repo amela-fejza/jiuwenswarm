@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from jiuwenswarm.extensions.agentos.auth.ssh_authenticator import SshPublicKeyAuthenticator
-from jiuwenswarm.extensions.agentos.auth.ssh_key_registry import (
+from jiuwenswarm.gateway.extensions.auth.ssh_authenticator import SshPublicKeyAuthenticator
+from jiuwenswarm.gateway.extensions.auth.ssh_key_registry import (
     KeyRegistry,
     KeyRegistryEntry,
 )
@@ -32,7 +32,7 @@ def _raise_missing_asyncssh(exc: ImportError) -> None:
     raise RuntimeError(
         "SSH channel is enabled but optional dependency `asyncssh>=2.14.0,<2.24` "
         "is not installed. Install with `pip install -e \".[ssh]\"` or "
-        '`uv sync --extra ssh` / `pip install "jiuwenswarm[ssh]"`.'
+        '`uv sync --extra ssh` / `pip install "workswarm[ssh]"`.'
     ) from exc
 
 

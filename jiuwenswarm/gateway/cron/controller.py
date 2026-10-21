@@ -11,10 +11,16 @@ from zoneinfo import ZoneInfo
 
 from openjiuwen.core.foundation.tool import LocalFunction, Tool, ToolCard
 
+from jiuwenswarm.common.work_mode import (
+    DEFAULT_PROJECT_ID_CODE,
+    DEFAULT_PROJECT_ID_WORK,
+    EXECUTION_WORK_MODES,
+)
 from jiuwenswarm.gateway.cron.cron_expr import normalize_cron_expr
 from jiuwenswarm.gateway.cron.models import (
     CRON_JOB_DESCRIPTION_MAX_LENGTH,
     CRON_JOB_NAME_MAX_LENGTH,
+    CRON_MODEL_SOURCE_LOGIN,
     CronTargetChannel,
     cron_job_metadata,
     cron_job_modes_for_tools,
@@ -22,14 +28,36 @@ from jiuwenswarm.gateway.cron.models import (
     normalize_cron_job_mcp,
     normalize_cron_job_mode,
     normalize_target_channel_id,
+    resolve_cron_model,
     validate_cron_model,
 )
+from jiuwenswarm.gateway.cron.proactive_cron_sync import PROACTIVE_JOB_ID
 from jiuwenswarm.gateway.cron.scheduler import CronSchedulerService, _cron_next_push_dt
 from jiuwenswarm.gateway.cron.store_base import CronJobStoreBackend
 
 
 # 列表/调度等批量路径查询"项目准入"闸门时的最大并发数。
 _GATE_QUERY_CONCURRENCY = 8
+
+
+def _login_credential_ref_from_session(auth_session: str) -> str:
+    """从服务端登录会话取华为账号身份，派生登录免费模型的凭据句柄绑定。
+
+    项目自身的路由 user_id（Web URL/localStorage）与华为账号登录是两套独立
+    用户体系，登录凭据按华为账号 openid 登记、两者没有映射——绑定只能来自
+    创建请求连接上的登录会话（``_auth_session``，由 web handler 注入）。
+    没有可用会话时明确拒绝，不留一个到点必失败的任务。
+    """
+    from jiuwenswarm.common.auth.login_credentials import credential_ref_for_user
+    from jiuwenswarm.common.auth.service import ModelAuthRequired, live_session
+
+    try:
+        session = live_session(auth_session or None, allow_refresh=False)
+    except ModelAuthRequired as exc:
+        raise ValueError(
+            "该模型需要登录华为账号后使用（未登录或登录已过期），请登录后重试"
+        ) from exc
+    return credential_ref_for_user(session.user_id)
 
 
 def _serialize_mutation(method):
@@ -55,6 +83,7 @@ class CronController:
             scheduler._lifecycle_mutation_lock = asyncio.Lock()
         self.mutation_lock = scheduler._lifecycle_mutation_lock
         self._target_channel: CronTargetChannel | None = None
+        self._agent_client: Any = None
         # 准入闸门是跨进程 RPC,列表时按项目去重后并发查询,这里限制并发上限,
         # 避免任务/项目很多时一次性打出上百个请求。
         self._gate_concurrency = asyncio.Semaphore(_GATE_QUERY_CONCURRENCY)
@@ -75,6 +104,18 @@ class CronController:
 
     def set_target_channel(self, channel: CronTargetChannel) -> None:
         self._target_channel = channel
+
+    def bind_agent_client(self, agent_client: Any) -> None:
+        """Keep the Gateway client used to read AgentServer's Zen cache."""
+        self._agent_client = agent_client
+
+    async def _zen_entries(self) -> list[dict[str, Any]]:
+        client = self._agent_client
+        if client is None:
+            return []
+        from jiuwenswarm.gateway.zen_query import fetch_zen_free_model_rows
+
+        return await fetch_zen_free_model_rows(client)
 
     @classmethod
     def get_instance(
@@ -257,6 +298,9 @@ class CronController:
         allow_unresolved_project_id = bool(
             params.pop("_agentos_project_binding_verified", False)
         )
+        # 登录会话 id：web handler 从创建连接上注入的服务端专有键（客户端传的
+        # 会被无条件覆盖），仅用于登录免费模型的凭据绑定捕获，不落任务数据。
+        auth_session = str(params.pop("_auth_session", "") or "").strip()
         name = str(params.get("name") or "").strip()
         cron_expr = normalize_cron_expr(str(params.get("cron_expr") or "").strip())
         timezone = (
@@ -271,14 +315,36 @@ class CronController:
             mode = normalize_cron_job_mode(mode)
         else:
             mode = None
-        model_name = validate_cron_model(params.get("model_name"))
+        # proactive.tick 是主动推荐开关自动维护的内部模式（proactive_cron_sync
+        # 以固定 id 注册）：用户路径创建同模式任务会被后端 mode 保护拒绝启停/
+        # 删除，而前端只按固定 id 识别系统任务，导致任务永远停不掉（#5128）。
+        if (
+            mode == "proactive.tick"
+            and str(params.get("id") or "").strip() != PROACTIVE_JOB_ID
+        ):
+            raise ValueError(
+                "proactive.tick 是系统内部模式，由设置→主动推荐开关自动维护，不能手动创建"
+            )
+        model_name, model_source = resolve_cron_model(
+            params.get("model_name"),
+            zen_entries=await self._zen_entries(),
+        )
         model_selection = params.get("model_selection")
         if model_selection is not None:
             from jiuwenswarm.common.model_selection import ModelSelection
-            from jiuwenswarm.server.runtime.model_routing_registry import ModelSelectionResolver
+            from jiuwenswarm.gateway.embedded.runtime.model_routing_registry import ModelSelectionResolver
             selection = ModelSelection.model_validate(model_selection)
             ModelSelectionResolver().resolve(selection)
             model_selection = selection.model_dump()
+        # 登录免费模型：把创建连接上的华为账号绑定到任务（凭据句柄）。路由
+        # user_id 与登录账号是两套独立体系，不能互相推导；没有可用登录会话就
+        # 明确拒绝（400），不留一个到点必失败的任务。自配模型（即使与登录模型
+        # 同名）不绑定，执行侧凭据注入只认绑定，不会误切到登录模型计费。
+        credential_ref = (
+            _login_credential_ref_from_session(auth_session)
+            if model_source == CRON_MODEL_SOURCE_LOGIN
+            else ""
+        )
         # mcp：会话级 MCP 选择，随 job 落库；调度执行时注入 chat.send 的
         # ``mcp`` 字段走 AgentServer 的 reconcile_session_mcp。只做类型
         # 规范化（strip/去空/去重），不校验存在性（断连后 job 应降级运行）。
@@ -295,7 +361,7 @@ class CronController:
         timeout_seconds = params.get("timeout_seconds")
         # work_mode 解析(严格校验:非法值由 resolve_request_work_mode 返回 BAD_REQUEST);
         # 默认值按 controller 目标通道推断(tui→code,web/未设置→work)
-        from jiuwenswarm.server.runtime.session.work_mode import (
+        from jiuwenswarm.gateway.runtime.work_mode import (
             resolve_request_work_mode,
         )
 
@@ -305,16 +371,13 @@ class CronController:
         work_mode, mode_err = resolve_request_work_mode(params, default_channel)
         if mode_err is not None:
             raise ValueError(f"invalid work_mode: {params.get('work_mode')!r}")
-        # project_id / project_dir → project_id 解析(设计文档 §6.1 + work_mode 隔离):
-        # 优先接受显式 project_id(修改计划 §5 链路 A,与 CronTools 保持一致):
-        # 1. 默认项目 ID(default/default_code)→ 直接使用,按 project_id 映射 work_mode
-        # 2. 真实 project_id → 校验存在且未隐藏,从 Project 记录注入精确 work_mode
-        # 3. 无显式 project_id → 按 (work_mode, project_dir) 解析可见项目,
-        #    匹配不到(含命中隐藏项目 / 无命中)归默认项目
-        # 非绝对路径抛 ValueError → BAD_REQUEST
-        # AgentOS 多用户时，此绑定已由目标 AgentServer 完成。Gateway 必须把该
-        # 结果作为不透明值持久化，绝不能再探测部署侧 project_store：即使两边
-        # 恰好存在同 ID 项目，也会造成 work_mode 被错误覆盖。
+        # project_id / project_dir → project_id 解析(设计文档 §6.1 + work_mode 隔离)。
+        # A3g：项目绑定统一由入口在目标 AgentServer 完成——web/tui 经
+        # PROJECT_CRON_RESOLVE_BINDING，agent 工具经 server 侧 CronTools——
+        # controller 把结果作为不透明值持久化，gateway 本地 project_store
+        # 反查已删除。marker 缺失时仅放行无项目字段/默认项目的系统路径
+        # （proactive.tick 等）；真实 project_id/project_dir 必须先经
+        # AgentServer 解析，防止绑定被部署侧同名项目污染。
         raw_project_id = str(params.get("project_id") or "").strip()
         project_dir_raw = params.get("project_dir")
         project_dir_val = (
@@ -322,25 +385,21 @@ class CronController:
             if isinstance(project_dir_raw, str) and project_dir_raw.strip()
             else ""
         )
-        if allow_unresolved_project_id:
-            # The marker is only injected after AgentServer-side validation.
-            # Do not import or read the Gateway-local project store on this path.
-            resolved_project_id = raw_project_id
-            caller_work_mode = str(params.get("work_mode") or "").strip()
-            if caller_work_mode in ("code", "work"):
-                work_mode = caller_work_mode
-        else:
-            from jiuwenswarm.server.runtime.session.project_store import (
-                resolve_cron_project_binding,
+        # 默认项目 ID（default/default_code）直接映射 work_mode，无需查表放行
+        is_default_project = raw_project_id in (DEFAULT_PROJECT_ID_WORK, DEFAULT_PROJECT_ID_CODE)
+        needs_agentos_resolution = bool(project_dir_val) or (
+            bool(raw_project_id) and not is_default_project
+        )
+        if needs_agentos_resolution and not allow_unresolved_project_id:
+            raise ValueError(
+                "cron project binding must be resolved by the target AgentServer"
             )
-
-            binding = resolve_cron_project_binding(
-                raw_project_id, project_dir_val, work_mode
-            )
-            if binding.error is not None:
-                raise ValueError(binding.error)
-            resolved_project_id = binding.project_id
-            work_mode = binding.work_mode
+        resolved_project_id = raw_project_id
+        caller_work_mode = str(params.get("work_mode") or "").strip()
+        if caller_work_mode in ("code", "work"):
+            work_mode = caller_work_mode
+        if work_mode not in EXECUTION_WORK_MODES:
+            raise ValueError(f"cron is not supported for work_mode: {work_mode!r}")
         app_id = str(params.get("app_id") or "").strip()
         # user_id：web 端创建定时任务时由 handler 注入 params（见 _cron_job_create），
         # 执行时透传给 faas 的 X-Session-Context。agent 内部创建的 cron 无 user_id 即存空串。
@@ -372,6 +431,7 @@ class CronController:
             app_id=app_id,
             work_mode=work_mode,
             user_id=user_id,
+            credential_ref=credential_ref,
         )
         await self._scheduler.reload()
         return job.to_dict()
@@ -382,10 +442,31 @@ class CronController:
         allow_unresolved_project_id = bool(
             patch.pop("_agentos_project_binding_verified", False)
         )
+        # 登录会话 id（服务端专有键，见 create_job）——改选登录模型时重绑凭据。
+        auth_session = str(patch.pop("_auth_session", "") or "").strip()
         if "mode" in patch:
             patch["mode"] = normalize_cron_job_mode(patch.get("mode"))
+            # 同 create_job：内部模式只随 proactive_cron_sync 注册，不允许把
+            # 既有任务改写成 proactive.tick（#5128）。
+            if patch["mode"] == "proactive.tick":
+                raise ValueError(
+                    "proactive.tick 是系统内部模式，由设置→主动推荐开关自动维护，不能手动修改"
+                )
         if "model_name" in patch:
-            patch["model_name"] = validate_cron_model(patch.get("model_name"))
+            canonical, model_source = resolve_cron_model(
+                patch.get("model_name"),
+                zen_entries=await self._zen_entries(),
+            )
+            patch["model_name"] = canonical
+            # 模型来源变化时同步重算绑定：改选登录模型 → 绑定当前连接的华为
+            # 账号；换回自配模型/清除模型 → 解绑，否则执行侧仍会注入登录凭据，
+            # 同名自配模型会被切到登录模型计费。
+            if model_source == CRON_MODEL_SOURCE_LOGIN:
+                patch["credential_ref"] = _login_credential_ref_from_session(
+                    auth_session
+                )
+            else:
+                patch["credential_ref"] = ""
         if "mcp" in patch:
             # 显式传 null/[] 归 None（清除选择，执行时回到全局默认集）。
             patch["mcp"] = normalize_cron_job_mcp(patch.get("mcp"))
@@ -406,33 +487,30 @@ class CronController:
                 str(patch.get("description") or ""), name
             )
 
-        # work_mode / project_id / project_dir 重解析(共享 helper):
-        # 与 cron_tools.py update_job 共用同一 ``resolve_cron_job_patch``,
-        # 确保 Web RPC 与 AgentTool 两条链路逻辑一致。
-        # 仅 AgentServer 已校验过的多用户请求可跳过 Gateway 本地反查；单用户仍须
-        # 因无效 project_id 明确失败，避免把失效 ID 写入定时任务。
+        # work_mode / project_id / project_dir 重解析:
+        # A3g：项目字段的重解析统一由入口经目标 AgentServer 完成（marker 标记），
+        # gateway 本地 project_store 反查已删除。marker 缺失的 patch 不允许
+        # 携带项目字段（必须先经 AgentServer 解析）；work_mode 单独 patch
+        # 沿用原规则拒绝（仅能伴随项目重解析生效）。
         from jiuwenswarm.common.work_mode import DEFAULT_WEB_WORK_MODE
 
         caller_work_mode = str(patch.get("work_mode") or "").strip()
-        if allow_unresolved_project_id:
-            # AgentServer has already resolved this project in the user's
-            # injected directory.  Never look up the deployment-side project
-            # table here: a colliding ID must not influence the stored job.
-            patch["work_mode"] = (
-                caller_work_mode
-                if caller_work_mode in ("code", "work")
-                else (existing.work_mode or DEFAULT_WEB_WORK_MODE)
+        has_project_fields = "project_id" in patch or "project_dir" in patch
+        patch_touches_binding = has_project_fields or "work_mode" in patch
+        if patch_touches_binding and not allow_unresolved_project_id:
+            if has_project_fields:
+                raise ValueError(
+                    "cron project binding must be resolved by the target AgentServer"
+                )
+            # 值本身可能合法，真正原因是 work_mode 不能脱离项目重解析单独 patch
+            raise ValueError(
+                "work_mode patch requires project re-resolution via target AgentServer"
             )
-        else:
-            from jiuwenswarm.server.runtime.session.project_store import (
-                resolve_cron_job_patch,
-            )
-
-            resolve_cron_job_patch(
-                patch,
-                existing_work_mode=existing.work_mode or "",
-                channel_id="web",
-            )
+        patch["work_mode"] = (
+            caller_work_mode
+            if caller_work_mode in ("code", "work")
+            else (existing.work_mode or DEFAULT_WEB_WORK_MODE)
+        )
 
         final_targets = str(patch.get("targets") or existing.targets).strip()
         if "session_id" in patch:
@@ -552,7 +630,10 @@ class CronController:
         if timeout_seconds is not None:
             params["timeout_seconds"] = timeout_seconds
         if model_name is not None and str(model_name).strip():
-            params["model_name"] = validate_cron_model(model_name)
+            params["model_name"] = validate_cron_model(
+                model_name,
+                zen_entries=await self._zen_entries(),
+            )
         if mcp is not None:
             params["mcp"] = mcp
         if project_dir is not None:

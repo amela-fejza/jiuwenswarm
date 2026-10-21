@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { AgentGroupCatalogItem } from '../../features/agentManagement';
-import { PageCard } from '../ui';
+import { PageCard, type PageCardDefaultButton } from '../ui';
 
 type GroupCardProps = {
   item: AgentGroupCatalogItem;
@@ -16,18 +16,12 @@ export function getAvatarTone(name: string): string {
   return ['variant-1', 'variant-2', 'variant-3', 'variant-4', 'variant-5', 'variant-6'][seed % 6];
 }
 
-function GroupAvatar({
-  item,
-  size = 'card',
-}: {
-  item: Pick<AgentGroupCatalogItem, 'displayName' | 'avatarUrl'>;
-  size?: 'card' | 'detail';
-}) {
+function GroupAvatar({ item }: { item: Pick<AgentGroupCatalogItem, 'displayName' | 'avatarUrl'> }) {
   const [imageFailed, setImageFailed] = useState(false);
   const avatarUrl = item.avatarUrl && !imageFailed ? item.avatarUrl : null;
   return (
     <span
-      className={`agent-management-avatar agent-group-avatar agent-group-avatar--${size} agent-group-avatar--${getAvatarTone(item.displayName)}`}
+      className={`agent-management-avatar agent-group-avatar agent-group-avatar--detail agent-group-avatar--${getAvatarTone(item.displayName)}`}
       aria-hidden="true"
     >
       {avatarUrl ? (
@@ -45,48 +39,26 @@ export function GroupCard({ item, busy, onOpen, onUse, onInstall }: GroupCardPro
   const canInstall = !item.installed && item.capabilities.canInstall;
   const description = item.description || t('agentManagement.unknownDescription');
   const label = item.tags.length > 0 ? item.tags.map((tag) => tag.label) : undefined;
-  const avatar = <GroupAvatar item={item} />;
-  const actionContent = (
-    <div
-      className="agent-management-card__actions"
-      aria-label={t('agentManagement.group.card.actions', { name: item.displayName })}
-      data-testid="agent-group-card-actions"
-      onClick={(event) => event.stopPropagation()}
-    >
-      {canUse ? (
-        <button
-          type="button"
-          className="agent-management-button agent-management-button--secondary agent-management-card-action--use"
-          data-testid="agent-group-card-action"
-          data-variant="use"
-          disabled={busy}
-          aria-disabled={!canUse}
-          onClick={(event) => {
-            event.stopPropagation();
-            onUse(item.id);
-          }}
-        >
-          {t('agentManagement.group.actions.use')}
-        </button>
-      ) : null}
-      {canInstall ? (
-        <button
-          type="button"
-          className="agent-management-button agent-management-button--primary"
-          data-testid="agent-group-card-action"
-          data-variant="install"
-          disabled={busy}
-          aria-busy={busy}
-          onClick={(event) => {
-            event.stopPropagation();
-            onInstall(item.id);
-          }}
-        >
-          {busy ? t('agentManagement.group.actions.installing') : t('agentManagement.group.actions.install')}
-        </button>
-      ) : null}
-    </div>
-  );
+  const avatar = { name: item.displayName, iconUrl: item.avatarUrl, testId: 'agent-management-group-card-avatar' };
+  const defaultButton: PageCardDefaultButton | undefined = canUse
+    ? {
+        text: t('agentManagement.group.actions.use'),
+        testId: 'agent-group-card-action',
+        variant: 'use',
+        disabled: busy,
+        className: 'agent-management-card-action--use',
+        onClick: () => onUse(item.id),
+      }
+    : canInstall
+      ? {
+          text: busy ? t('agentManagement.group.actions.installing') : t('agentManagement.group.actions.install'),
+          testId: 'agent-group-card-action',
+          variant: 'install',
+          disabled: busy,
+          busy,
+          onClick: () => onInstall(item.id),
+        }
+      : undefined;
 
   return (
     <PageCard
@@ -101,7 +73,7 @@ export function GroupCard({ item, busy, onOpen, onUse, onInstall }: GroupCardPro
       title={item.displayName}
       label={label}
       description={description}
-      actionSlot={actionContent}
+      defaultButton={defaultButton}
     />
   );
 }

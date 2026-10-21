@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -24,8 +25,21 @@ from jiuwenswarm.extensions.yuanrong_frontend_client import (
 )
 
 DEFAULT_AGENT_WORKSPACE_ROOT = "/home/agentos/users"
-# Env override for gateway.agentos.sandbox_idle_timeout_seconds (vibeskill-aligned).
+# Env override for the startup seed of the Agent Sandbox idle timeout. At runtime the management-plane
+# (etcd) value applied by ConfigUpdater outranks this.
 SANDBOX_IDLE_TIMEOUT_ENV = "SANDBOX_IDLE_TIMEOUT_SECONDS"
+# Env seeds for the builtin Agent Sandbox CPU/memory. The
+# management-plane (etcd) values applied by ConfigUpdater outrank these.
+BUILTIN_AGENT_CPU_ENV = "AGENTOS_BUILTIN_AGENT_CPU"
+BUILTIN_AGENT_MEMORY_ENV = "AGENTOS_BUILTIN_AGENT_MEMORY"
+# Env seeds for the Tool Sandbox. These names must match what AgentServer reads
+# when it builds the yuanrong tool sandbox (``sysop_builder._TOOL_SANDBOX_ENV_OVERRIDES``);
+# the same constants are re-emitted into a newly created AgentServer sandbox.
+# Tool Sandbox idle timeout is integer seconds: the tool-sandbox provider
+# (yuanrong/jiuwenbox) coerces ``extra_params["idle_timeout"]`` with ``int()``.
+TOOL_SANDBOX_IDLE_TIMEOUT_ENV = "TOOL_SANDBOX_IDLE_TIMEOUT"
+TOOL_SANDBOX_CPU_ENV = "TOOL_SANDBOX_CPU"
+TOOL_SANDBOX_MEMORY_ENV = "TOOL_SANDBOX_MEMORY"
 # Env override for gateway.agentos.disconnect_cleanup_timeout_seconds.
 DISCONNECT_CLEANUP_TIMEOUT_ENV = "DISCONNECT_CLEANUP_TIMEOUT_SECONDS"
 # Env overrides for YuanRong TCP probes / GET wait (win over yaml).
@@ -62,8 +76,21 @@ class RouterConfig:
     agent_key_fields: tuple[str, ...] = DEFAULT_AGENT_KEY_FIELDS
     workspace_root: str = DEFAULT_AGENT_WORKSPACE_ROOT
     # Idle sandbox reclamation: delete the YuanRong instance once an agent
-    # has no held tasks (chat/SSH) for this long. <= 0 disables reclamation.
+    # has no held tasks (chat/SSH/web) for this long. <= 0 disables reclamation.
     sandbox_idle_timeout_seconds: float = 600.0
+    # Builtin jiuwenswarm agent sandbox resources, passed to the YuanRong
+    # ``/api/agent`` create call as ``runtime_spec.cpu`` / ``memory``. Only
+    # affect sandboxes created after the value changes.
+    agent_sandbox_cpu: int = 2000
+    agent_sandbox_memory: int = 4096
+    # Tool Sandbox settings are not consumed by Gateway. They are forwarded to
+    # each newly created AgentServer instance as environment values; the
+    # AgentServer/tool provider decides how to use them.
+    # idle_timeout is integer seconds: the tool-sandbox provider coerces it
+    # with ``int()`` (yuanrong/jiuwenbox sandbox providers).
+    tool_sandbox_idle_timeout_seconds: int = 600
+    tool_sandbox_cpu: int = 2000
+    tool_sandbox_memory: int = 4096
     sandbox_idle_check_interval_seconds: float = 30.0
     # Channel-disconnect cleanup: when a user has zero live channels, wait this
     # long before deleting their jiuwenswarm agent (gives a chance to reconnect
@@ -84,12 +111,7 @@ class RouterConfig:
 
 
 def agentos_router_selected(config: dict[str, Any]) -> bool:
-    gateway = config.get("gateway") if isinstance(config, dict) else {}
-    if not isinstance(gateway, dict):
-        return False
-    agent_client = gateway.get("agent_client")
-    if not isinstance(agent_client, dict):
-        agent_client = {}
+    agent_client = read_mapping_path(config, "gateway", "agent_client")
     return (
         str(agent_client.get("type") or "websocket").strip().lower()
         == "agentos_router"
@@ -119,12 +141,38 @@ def load_ssh_channel_endpoint(config: dict[str, Any]) -> SshChannelEndpoint | No
     return SshChannelEndpoint(ip=ip, port=port)
 
 
-def _read_float(section: dict[str, Any], key: str, default: float) -> float:
-    """Read a float honoring explicit ``0`` (``or default`` would swallow it)."""
-    raw = section.get(key)
+def read_mapping_path(config: Any, *path: str) -> Mapping[str, Any]:
+    """Return a nested mapping, or an empty mapping when the path is invalid."""
+    current = config
+    for key in path:
+        if not isinstance(current, Mapping):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, Mapping) else {}
+
+
+def read_optional_float(section: Any, key: str) -> float | None:
+    """Read an optional float from a mapping; missing or blank returns None."""
+    mapping = section if isinstance(section, Mapping) else {}
+    raw = mapping.get(key)
     if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return default
+        return None
     return float(raw)
+
+
+def read_optional_int(section: Any, key: str) -> int | None:
+    """Read an optional int from a mapping; missing or blank returns None."""
+    mapping = section if isinstance(section, Mapping) else {}
+    raw = mapping.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    return int(raw)
+
+
+def _read_float(section: Mapping[str, Any], key: str, default: float) -> float:
+    """Read a float honoring explicit ``0`` (``or default`` would swallow it)."""
+    value = read_optional_float(section, key)
+    return default if value is None else value
 
 
 def _read_float_env(name: str) -> float | None:
@@ -138,7 +186,21 @@ def _read_float_env(name: str) -> float | None:
     return float(text)
 
 
-def _read_bool(section: dict[str, Any], key: str, default: bool) -> bool:
+def resolve_float_setting(
+    section: Mapping[str, Any],
+    key: str,
+    env_name: str,
+    default: float,
+) -> float:
+    """Resolve a float setting with env > YAML > default precedence."""
+    environment = _read_float_env(env_name)
+    if environment is not None:
+        return environment
+    configured = read_optional_float(section, key)
+    return configured if configured is not None else default
+
+
+def _read_bool(section: Mapping[str, Any], key: str, default: bool) -> bool:
     """Read a bool; missing / blank keeps *default*; explicit false/0/no/off disables."""
     raw = section.get(key)
     if raw is None or (isinstance(raw, str) and not str(raw).strip()):
@@ -148,7 +210,7 @@ def _read_bool(section: dict[str, Any], key: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _read_int(section: dict[str, Any], key: str, default: int) -> int:
+def _read_int(section: Mapping[str, Any], key: str, default: int) -> int:
     """Read an int honoring explicit ``0`` (``or default`` would swallow it)."""
     raw = section.get(key)
     if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -182,17 +244,17 @@ def _require_positive(value: int | float, *, name: str) -> None:
         raise ValueError(f"{name} must be > 0, got {value}")
 
 
-def _load_probe_settings(agentos: dict[str, Any]) -> RuntimeProbeSettings:
+def _load_probe_settings(agentos: Mapping[str, Any]) -> RuntimeProbeSettings:
     """Load ``gateway.agentos.probes``; env wins over yaml."""
     defaults = DEFAULT_RUNTIME_PROBE_SETTINGS
     probes = agentos.get("probes")
-    if not isinstance(probes, dict):
+    if not isinstance(probes, Mapping):
         probes = {}
     startup = probes.get("startup")
-    if not isinstance(startup, dict):
+    if not isinstance(startup, Mapping):
         startup = {}
     liveness = probes.get("liveness")
-    if not isinstance(liveness, dict):
+    if not isinstance(liveness, Mapping):
         liveness = {}
 
     wait_running_env = _read_float_env(WAIT_RUNNING_TIMEOUT_ENV)
@@ -314,18 +376,9 @@ def _load_probe_settings(agentos: dict[str, Any]) -> RuntimeProbeSettings:
 
 
 def load_router_config(config: dict[str, Any]) -> RouterConfig:
-    gateway = config.get("gateway") if isinstance(config, dict) else {}
-    if not isinstance(gateway, dict):
-        gateway = {}
-    agent_client = gateway.get("agent_client")
-    if not isinstance(agent_client, dict):
-        agent_client = {}
-    agentos = gateway.get("agentos")
-    if not isinstance(agentos, dict):
-        agentos = {}
-    registry = agentos.get("registry")
-    if not isinstance(registry, dict):
-        registry = {}
+    agent_client = read_mapping_path(config, "gateway", "agent_client")
+    agentos = read_mapping_path(config, "gateway", "agentos")
+    registry = read_mapping_path(config, "gateway", "agentos", "registry")
 
     frontend_endpoint = str(agent_client.get("frontend_endpoint") or "").strip()
     function_version_urn = str(
@@ -341,13 +394,26 @@ def load_router_config(config: dict[str, Any]) -> RouterConfig:
     timeout = float(agentos.get("timeout") or 10)
     auth_enabled = str(agentos.get("auth_enabled", "false")).strip().lower() in ("true", "1", "yes")
 
-    # Env wins over yaml (incl. explicit 0 to disable), same as vibeskill.
-    idle_timeout_env = _read_float_env(SANDBOX_IDLE_TIMEOUT_ENV)
-    sandbox_idle_timeout_seconds = (
-        idle_timeout_env
-        if idle_timeout_env is not None
-        else _read_float(agentos, "sandbox_idle_timeout_seconds", 600.0)
+    # Local config seed path is unchanged; the etcd management-plane contract
+    # uses the separate ``agent_sandbox.idle_timeout`` path and outranks it.
+    sandbox_idle_timeout_seconds = resolve_float_setting(
+        agentos,
+        "sandbox_idle_timeout_seconds",
+        SANDBOX_IDLE_TIMEOUT_ENV,
+        600.0,
     )
+    # Agent Sandbox CPU/memory are not stored in config.yaml; env seeds the
+    # startup value and the management plane overrides it at runtime.
+    agent_sandbox_cpu = _overlay_int_env(2000, BUILTIN_AGENT_CPU_ENV)
+    agent_sandbox_memory = _overlay_int_env(4096, BUILTIN_AGENT_MEMORY_ENV)
+    tool_sandbox_idle_timeout_env = _read_int_env(TOOL_SANDBOX_IDLE_TIMEOUT_ENV)
+    tool_sandbox_idle_timeout_seconds = (
+        600
+        if tool_sandbox_idle_timeout_env is None
+        else tool_sandbox_idle_timeout_env
+    )
+    tool_sandbox_cpu = _overlay_int_env(2000, TOOL_SANDBOX_CPU_ENV)
+    tool_sandbox_memory = _overlay_int_env(4096, TOOL_SANDBOX_MEMORY_ENV)
 
     disconnect_cleanup_env = _read_float_env(DISCONNECT_CLEANUP_TIMEOUT_ENV)
     disconnect_cleanup_timeout_seconds = (
@@ -379,6 +445,11 @@ def load_router_config(config: dict[str, Any]) -> RouterConfig:
         ).strip()
         or DEFAULT_AGENT_WORKSPACE_ROOT,
         sandbox_idle_timeout_seconds=sandbox_idle_timeout_seconds,
+        agent_sandbox_cpu=agent_sandbox_cpu,
+        agent_sandbox_memory=agent_sandbox_memory,
+        tool_sandbox_idle_timeout_seconds=tool_sandbox_idle_timeout_seconds,
+        tool_sandbox_cpu=tool_sandbox_cpu,
+        tool_sandbox_memory=tool_sandbox_memory,
         sandbox_idle_check_interval_seconds=_read_float(
             agentos, "sandbox_idle_check_interval_seconds", 30.0
         ),

@@ -21,7 +21,7 @@ import { useClickOutside } from './useClickOutside';
 import SimpleSelect from './SimpleSelect';
 import { hasXiaoyiPushApiId, isCronTargetOptionDisabled } from './xiaoyiCronTarget';
 import emptyIllustration from '../../assets/cron-empty.svg';
-import { PageToolbarSearch } from '../ui';
+import { PageToolbarSearch, toast } from '../ui';
 
 // 任务列表分页：每页条数可选项（默认 20），纯前端本地分页——后端 cron.job.list 目前
 // 一次性返回全部任务、不支持 offset/limit，见 bug002 progress.md 的方案说明
@@ -346,6 +346,7 @@ export default function CronPanel({ sessionId, onCreateViaChat, onSelectSession 
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [currentPage, setCurrentPage] = useState(1);
   const tableWrapperRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   // "运行状态"筛选（下拉多选）：空集合 = 不筛选（显示全部），跟名称搜索是 AND 关系，
   // 只在任务列表 tab 展示这个筛选器（模板/执行历史没有"运行状态"这个概念）
@@ -532,7 +533,7 @@ export default function CronPanel({ sessionId, onCreateViaChat, onSelectSession 
   // silent=true 用于轮询/可见性刷新等后台静默拉取：不切 loading 态、失败时不清空现有列表、
   // 不弹错误提示，避免偶发网络抖动打断用户正在看的内容（见 bug007/bug008/bug009 progress.md）
   const loadJobs = useCallback(
-    async (projectList: ProjectInfo[], options?: { silent?: boolean }) => {
+    async (projectListInput: ProjectInfo[] | Promise<ProjectInfo[]>, options?: { silent?: boolean }) => {
       const silent = options?.silent ?? false;
       if (!silent) {
         setLoading(true);
@@ -545,6 +546,9 @@ export default function CronPanel({ sessionId, onCreateViaChat, onSelectSession 
         // （见 bug007/bug008/bug009 progress.md：此前 isWebChannelJob 过滤把非 web 任务藏掉，
         // 导致飞书建的任务在 web 列表永不出现，轮询再勤也无济于事）
         const allJobs = payload.jobs || [];
+        // cron.job.list 请求本身不依赖项目列表（仅本地映射需要）：先发请求再等
+        // projects，挂载时才能与 project.list 真正并行；对传数组的调用方是 no-op
+        const projectList = await projectListInput;
         setJobs(allJobs.map((j) => cronJobToUI(j, projectList)));
       } catch (loadError) {
         if (silent) {
@@ -614,9 +618,11 @@ export default function CronPanel({ sessionId, onCreateViaChat, onSelectSession 
 
   useEffect(() => {
     void (async () => {
-      const projectList = await loadProjects();
-      await loadJobs(projectList);
-      await loadChannels();
+      // 首开关键路径（issue #4885）：cron.job.list 请求不依赖 project.list 的
+      // 结果（只有 loadJobs 里的本地映射需要），两者并行把关键路径从两个串行
+      // 往返压到一个；channel.get 只影响推送下拉选项，一并并行
+      const projectsPromise = loadProjects();
+      await Promise.all([loadJobs(projectsPromise), loadChannels()]);
     })();
   }, [loadChannels, loadJobs, loadProjects]);
 
@@ -875,10 +881,46 @@ export default function CronPanel({ sessionId, onCreateViaChat, onSelectSession 
       // 推荐消息会自然出现在用户当前会话里，无需主动跳转。
       const isProactiveJob = confirmState.job.id === PROACTIVE_AUTO_JOB_ID;
       if (result.session_id && !isProactiveJob) {
+        // 跳转会卸载 CronPanel，面板内 success state 活不到下一次渲染，用户看不到
+        // 「任务已触发立即执行」反馈。改由 App 根部常驻的命令式 toast 承载：ToastStack
+        // 通过 portal 挂在 body 上，不随 CronPanel 卸载，跳转后提示仍在目标会话顶部可见。
+        // 固定 id 去重，连续触发多个任务时不会叠出一排提示。testId 保持既有自动化锚点不变。
+        // proactive 分支不跳转、面板不卸载，继续用面板内 setSuccess（既有用例预期）。
+        // 视觉风格与位置均与「任务更新成功」等面板内提示保持一致：实心绿底、白字、无图标、
+        // 无关闭按钮、2s 自动消失。通过 panelRef.getBoundingClientRect() 取 CronPanel 容器
+        // 顶部居中坐标，用 position:fixed + transform 让 toast 精确落在面板内提示的同一位置
+        // （面板内提示是 absolute top-3 left-1/2 -translate-x-1/2，受左侧 ConversationSidebar
+        // 影响，其水平中心不是视口中心；toast 默认 fixed 视口居中会与面板内提示错位）。
+        // animation:none 禁用 toast 默认入场/退场动画，避免其 transform 覆盖 translateX(-50%)。
+        const panelRect = panelRef.current?.getBoundingClientRect();
+        toast.open({
+          id: 'cron-run-now-success',
+          content: t('cron.success.runNow'),
+          variant: 'default',
+          testId: 'cron-success-toast',
+          duration: 2,
+          closable: false,
+          style: {
+            position: 'fixed',
+            top: panelRect ? `${panelRect.top + 12}px` : '12px',
+            left: panelRect ? `${panelRect.left + panelRect.width / 2}px` : '50%',
+            transform: 'translateX(-50%)',
+            animation: 'none',
+            width: 'auto',
+            background: 'var(--color-feedback-success)',
+            color: 'var(--color-text-inverse)',
+            border: 'none',
+            fontSize: '14px',
+            lineHeight: '20px',
+            borderRadius: 'var(--radius-lg)',
+          },
+        });
         useCronStore.getState().setLastRunSessionId(confirmState.job.id, result.session_id);
         onSelectSession(result.session_id);
+      } else {
+        // proactive 或后端未返回 session_id：面板不卸载，local state 提示生命周期足够
+        setSuccess(t(isProactiveJob ? 'cron.success.proactiveRunNow' : 'cron.success.runNow'));
       }
-      setSuccess(t(isProactiveJob ? 'cron.success.proactiveRunNow' : 'cron.success.runNow'));
       // 刷新左侧栏该定时任务下展开的 session 列表（project.get_cron_sessions）
       const { id: cronId, projectId } = confirmState.job;
       if (cronId && projectId) {
@@ -1384,6 +1426,7 @@ export default function CronPanel({ sessionId, onCreateViaChat, onSelectSession 
     // 出现会撑高面板内容 → 面板竖向滚动条出现 → 内容宽度变窄 → 表格更贴 min-width → 横向滚动条
     // 翻转 → 高度又变 → 在临界宽度附近来回抖动（x 滚动条快速切换闪烁的根源）
     <div
+      ref={panelRef}
       className="flex-1 min-h-0 relative overflow-y-auto [scrollbar-gutter:stable]"
       onScroll={closeRowPopovers}
       data-testid="cron-panel"
