@@ -1643,8 +1643,13 @@ async def _ensure_team_pulse(
     """
     if current_monitor is None:
         return
+    get_pulse = getattr(tm, "get_team_pulse", None)
+    register_pulse = getattr(tm, "register_team_pulse", None)
+    pop_pulse = getattr(tm, "pop_team_pulse", None)
+    if not all(callable(fn) for fn in (get_pulse, register_pulse, pop_pulse)):
+        return
     current_agent = monitor_team_agent(current_monitor)
-    existing = tm.get_team_pulse(session_id)
+    existing = get_pulse(session_id)
     healthy = (
         existing is not None
         and existing.is_running
@@ -1658,7 +1663,7 @@ async def _ensure_team_pulse(
             await existing.stop()
         except Exception as exc:
             logger.warning("[TeamHelpers] TeamPulse stop failed: %s", exc)
-        tm.pop_team_pulse(session_id)
+        pop_pulse(session_id)
 
     pulse_monitor = await _get_active_team_monitor(team_name, session_id)
     if pulse_monitor is None:
@@ -1682,7 +1687,7 @@ async def _ensure_team_pulse(
         except Exception as stop_exc:
             logger.warning("[TeamHelpers] TeamPulse cleanup after start failure: %s", stop_exc)
         return
-    tm.register_team_pulse(session_id, service)
+    register_pulse(session_id, service)
     logger.info(
         "[TeamHelpers] TeamPulse started: session_id=%s team_name=%s",
         session_id,
