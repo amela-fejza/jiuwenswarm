@@ -1566,19 +1566,40 @@ def preserve_agent_group_display_identity(
     agent_group_name: str, identity: dict[str, Any]
 ) -> None:
     """Persist missing legacy snapshots before uninstall removes their source."""
+    from jiuwenswarm.server.runtime.session import lifecycle as lc
+
     sessions_dir = get_agent_sessions_dir()
-    if not sessions_dir.is_dir():
-        return
-    for session_dir in sessions_dir.iterdir():
-        if not session_dir.is_dir():
+    archived_dir = sessions_dir.parent / "sessions_archived"
+    session_ids: set[str] = set()
+    for root in (sessions_dir, archived_dir):
+        if not root.is_dir():
             continue
-        session_id = session_dir.name
-        metadata = _read_metadata_file_in(session_dir)
-        if (
-            metadata.get("agent_group_name") != agent_group_name
-            or "team_group_identity" in metadata
-        ):
-            continue
+        for directory in root.iterdir():
+            if directory.is_dir():
+                session_ids.add(directory.name)
+    for session_id in sorted(session_ids):
+        with lc.resource_lock("session", session_id):
+            session_dir = lc.resolve_session(
+                session_id, must_exist=False, sessions_root=sessions_dir
+            )
+            metadata = _read_metadata_file_in(session_dir)
+            if (
+                metadata.get("agent_group_name") != agent_group_name
+                or "team_group_identity" in metadata
+            ):
+                continue
+            if session_dir.parent == archived_dir:
+                operation = lc.state("session", session_id).get("operation")
+                if operation and operation.get("status") != "completed":
+                    raise lc.LifecycleError(
+                        "OPERATION_IN_PROGRESS", "session lifecycle operation in progress"
+                    )
+                # Archived metadata maintenance follows archive_time's locked
+                # atomic write; runtime write fences remain unchanged.
+                metadata["team_group_identity"] = copy.deepcopy(identity)
+                lc.atomic_json(session_dir / "metadata.json", metadata)
+                remove_session_metadata_cache(session_id)
+                continue
         metadata["team_group_identity"] = copy.deepcopy(identity)
         options = _MetadataWriteOptions(
             merge_fields=frozenset({"team_group_identity"}),
@@ -1753,11 +1774,17 @@ def set_session_pinned(session_id: str, pinned: bool) -> tuple[bool, int] | None
             sessions_dir = get_agent_sessions_dir()
             pinned_list: list[tuple[str, int]] = []
             if sessions_dir.is_dir():
+                from jiuwenswarm.server.runtime.session import lifecycle as lc
                 for session_dir in sessions_dir.iterdir():
                     if not session_dir.is_dir():
                         continue
                     sid = session_dir.name
                     if sid.startswith(_EPHEMERAL_PROBE_SESSION_PREFIXES):
+                        continue
+                    state = lc.state("session", sid)
+                    if lc.logically_deleted(state) or lc.logically_archived(state):
+                        # Accepted but not yet moved/deleted: it already left
+                        # the active pin ordering.
                         continue
                     scanned += 1
                     m = meta if sid == session_id else _read_metadata(sid)
@@ -2157,6 +2184,11 @@ def get_all_sessions_metadata(
         if session_id.startswith(_EPHEMERAL_PROBE_SESSION_PREFIXES):
             continue
         state = lc.state("session", session_id)
+        # Lifecycle state is authoritative for visibility: archive and delete
+        # are accepted before the directory moves or disappears, so the active
+        # list must hide the Session while cleanup runs in the background.
+        if lc.logically_deleted(state) or lc.logically_archived(state):
+            continue
         archived = lc.session_paths(session_id)[1].exists()
         if archived:
             continue
@@ -2296,6 +2328,10 @@ def _collect_all_sessions_metadata(
             continue
         state = lc.state("session", sid)
         if lc.session_paths(sid, sessions_root=sessions_dir)[1].exists():
+            continue
+        # Lifecycle state is authoritative for visibility: archive and delete
+        # are accepted before the directory moves or disappears.
+        if lc.logically_deleted(state) or lc.logically_archived(state):
             continue
         if user_id:
             # 按用户家目录读时,绕过走全局单例的 _read_metadata,直接读该目录下文件,

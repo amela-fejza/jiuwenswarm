@@ -127,7 +127,7 @@ Use the following commands during a channel conversation:
 > - 2 formal aliases (`MODE_ALIASES` keys): `team.plan` (→ `team.work.plan`), `team.code` (→ `team.code.normal`)
 > - Auto selection: `auto` (with `agent.auto` and `macro.auto` accepted where mode canonicalization is used)
 >
-> Any string outside this set is rejected as an illegal command by the gateway pre-check (`_VALID_MODE_INPUTS` in `jiuwenswarm/gateway/message_handler/message_handler.py`). Legacy strings are silently mapped to the new canonical via `deprecate_mode()`.
+> Any string outside this set is rejected as an illegal command by the gateway pre-check (`_VALID_MODE_INPUTS` in `gateway/message_handler/message_handler.py`). Legacy strings are silently mapped to the new canonical via `deprecate_mode()`.
 
 You can also use `/switch` to change sub-modes within the same category:
 
