@@ -44,7 +44,11 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional
 import logging
 from logging.handlers import BaseRotatingHandler
+import portalocker
 from ruamel.yaml import YAML
+
+from jiuwenswarm.common.agentos_runtime import is_agentos_runtime
+from jiuwenswarm.common.runtime_log_filter import install_runtime_log_filter
 
 _LOG_FILE_MAX_BYTES = 20 * 1024 * 1024
 _LOG_FILE_BACKUP_COUNT = 20
@@ -326,9 +330,24 @@ def _load_logging_config_from_yaml() -> dict[str, Any]:
         cf = get_config_file()
         if not cf.exists():
             return {}
-        rt = YAML()
-        with open(cf, "r", encoding="utf-8") as f:
-            data = rt.load(f) or {}
+        # Logging reads values only. Round-trip comment preservation makes
+        # importing this module parse the entire config on the Front startup path.
+        rt = YAML(typ="safe")
+        content = cf.read_text(encoding="utf-8")
+        section = re.search(r'(?m)^(?:logging|[\"\']logging[\"\'])\s*:', content)
+        if section is None:
+            # A valid flow mapping need not have a standalone logging section.
+            data = rt.load(content) or {}
+        else:
+            boundary = re.search(r"(?m)^[^\s#]", content[section.end():])
+            end = section.end() + boundary.start() if boundary else len(content)
+            try:
+                data = rt.load(content[section.start():end]) or {}
+            except Exception:
+                # A logging alias may reference an anchor from another section.
+                data = YAML(typ="safe").load(content) or {}
+        if not isinstance(data, dict):
+            return {}
         raw = data.get("logging")
         if isinstance(raw, dict):
             return raw
@@ -884,19 +903,22 @@ def ensure_config_migrated_from_template(
 ) -> bool:
     """将模板新增的配置项合并进用户 config.yaml（保留用户已有值）。
 
-    版本号短路：用户 config.config_version == 程序 VERSION 时跳过迁移；
-    不一致时迁移，迁移成功后由 migrate_config_from_template 把 config_version 写回程序版本。
+    AgentOS 配置由部署模板管理，跳过包内默认模板的结构同步。
+    每次启动检查模板新增项；迁移成功后由 migrate_config_from_template
+    把 config_version 写回应用版本与打包日期。版本号相同也不能证明模板内容未变化。
 
-    合并为纯增量操作：只补齐模板新增项，不会删除用户 config.yaml 中
+    合并只补齐模板新增项，不会删除用户 config.yaml 中
     模板里没有的配置项（模板是示例文档而非 schema，其中本就包含留给
     用户填写的开放式配置节）。因此本函数可以每次启动安全调用。
 
-    Merges newly added template keys into the user's config.yaml. The merge is
-    purely additive: keys the operator added that the template does not contain
-    are preserved, so this is safe to call on every start.
+    Merges newly added template keys. Existing values and operator-added keys
+    are preserved.
     """
-    from jiuwenswarm.common.config import migrate_config_from_template, load_yaml_round_trip
-    from jiuwenswarm.common._build_config import VERSION
+    if is_agentos_runtime():
+        return False
+
+    from jiuwenswarm.common.config import migrate_config_from_template
+    from jiuwenswarm.common.version import get_runtime_version_label
 
     root = Path(workspace_dir) if workspace_dir else get_user_workspace_dir()
     config_path = root / "config" / "config.yaml"
@@ -907,27 +929,16 @@ def ensure_config_migrated_from_template(
         logger.warning(f"跳过配置迁移: {e}")
         return False
 
-    # 版本号短路：已同步则跳过（不跑 _deep_merge、不读模板内容）
-    # config 不存在时交由 migrate_config_from_template 内部 exists() 优雅处理，不在此抛 FileNotFoundError
-    if not config_path.exists():
-        return migrate_config_from_template(template_path, config_path)
-
-    user_data = load_yaml_round_trip(config_path)
-    if isinstance(user_data, dict) and user_data.get("config_version") == VERSION:
-        logger.debug(f"config 版本 {VERSION} 一致，跳过迁移: {config_path}")
+    # The migration skips a missing config file and writes only on change.
+    try:
+        migrated = migrate_config_from_template(template_path, config_path)
+    except (TimeoutError, portalocker.exceptions.LockException) as exc:
+        logger.warning("跳过配置迁移，获取配置写锁失败: %s", exc)
+        return False
+    if not migrated:
         return False
 
-    if isinstance(user_data, dict) and user_data.get("config_version"):
-        logger.info(
-            f"config 版本 {user_data.get('config_version')} != 程序 {VERSION}，开始迁移"
-        )
-    else:
-        logger.info(f"config 无版本号(未迁移)，开始迁移到 {VERSION}")
-
-    if not migrate_config_from_template(template_path, config_path):
-        return False
-
-    logger.info(f"已从模板合并新增配置项: {config_path} (config_version -> {VERSION})")
+    logger.info(f"已同步配置模板: {config_path} (config_version = {get_runtime_version_label()})")
     return True
 
 
@@ -1070,6 +1081,7 @@ def prepare_workspace(
     overwrite: bool = True,
     preferred_language: Optional[str] = None,
     workspace_dir: Optional[Path] = None,
+    migrate_config: bool = True,
 ) -> CopyDiffResult:
     package_root = _find_package_root()
     if not package_root:
@@ -1095,7 +1107,8 @@ def prepare_workspace(
     config_dest_dir.mkdir(parents=True, exist_ok=True)
     config_yaml_dest = config_dest_dir / "config.yaml"
 
-    if overwrite or not config_yaml_dest.exists():
+    config_initialized = overwrite or not config_yaml_dest.exists()
+    if config_initialized:
         with TrackCopyDiff(
             dest=config_yaml_dest,
             is_file=True,
@@ -1261,8 +1274,12 @@ def prepare_workspace(
 
     from jiuwenswarm.common.config import migrate_config_from_template, set_preferred_language_in_config_file
 
-    migrate_config_from_template(config_yaml_src, config_yaml_dest)
-    set_preferred_language_in_config_file(config_yaml_dest, resolved_lang)
+    if migrate_config:
+        migrate_config_from_template(config_yaml_src, config_yaml_dest)
+    # Runtime MCP repairs must leave an existing AgentOS deployment config intact.
+    # Fresh initialization and an explicit language choice can still set the language.
+    if config_initialized or preferred_language is not None or not is_agentos_runtime():
+        set_preferred_language_in_config_file(config_yaml_dest, resolved_lang)
 
     # ----- 默认安装内置技能: skill-creator 和 swarmskill-creator -----
     _install_default_builtin_skills(
@@ -1460,7 +1477,7 @@ def _ensure_mcp_builtins(
                 "MCP seed contains unexpected root files: "
                 + ", ".join(sorted(unexpected_root_files))
             )
-        from jiuwenswarm.server.runtime.mcp.package_manifest import iter_mcp_packages
+        from jiuwenswarm.common.mcp_package_manifest import iter_mcp_packages
 
         package_dirs = [
             path for path in tmp_dir.iterdir()
@@ -1541,7 +1558,7 @@ def prepare_runtime_workspace(
         )
     )
     if workspace_preparation_needed:
-        prepare_workspace(overwrite=False, workspace_dir=workspace_dir)
+        prepare_workspace(overwrite=False, workspace_dir=workspace_dir, migrate_config=False)
 
     if migrate_config:
         ensure_config_migrated_from_template(workspace_dir)
@@ -2364,6 +2381,8 @@ def resolve_git_branch(project_dir: str | None) -> str:
                 [git_bin, "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
                 cwd=project_dir,
             )
@@ -2491,28 +2510,24 @@ _KV_SENSITIVE_PATTERN = re.compile(
     r"amap[_-]?key|map[_-]?ak)"
     r"(?![A-Za-z0-9])(\s*[:=]\s*)([\"']?)([^,\s\"'\]\}]+)([\"']?)"
 )
-# 匹配“键名包含敏感关键词”且“值被引号包裹”的场景，覆盖:
-# - 'CAT_CAFE_CALLBACK_TOKEN': 'xxxx'
-# - 'CAT_CAFE_USER_ID': 'CSDN-weixin'
-# - "my_private_key"="xxxx"
-# 分组说明：
-# 1) 完整的 key + 分隔符（含可选引号）
-# 2) 值的起始引号（' 或 "）
-# 3) 值内容（非贪婪）
-# 4) 结束引号（通过 (\2) 强制与起始引号一致）
-# The leading lookbehind only lets a match start where a key run starts. Without
-# it the unanchored ``[A-Za-z0-9_.-]*`` rescans the rest of the run from every
-# offset, which is quadratic on long identifier-like text (8k chars took ~3.6s).
-# Matches are unchanged: a leftmost match can never start mid-run, because the
-# ``*`` would absorb the preceding key character too.
-_NAMED_SENSITIVE_KV_PATTERN = re.compile(
-    r"(?i)(?<![A-Za-z0-9_.-])([\"']?[A-Za-z0-9_.-]*"
-    r"(?:token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
+# 匹配被引号包裹的通用键值对起点；键是否敏感在 Python 代码中判断。
+#
+# 旧实现把两个无界 ``[A-Za-z0-9_.-]*``、关键词分支、``.*?`` 与反向
+# 引用组合在一个正则中。面对 10KB 连续标识符且最终不匹配时，Python ``re``
+# 会从大量位置反复回溯，呈近似 O(n²) 退化。这里用左边界保证每个 key token
+# 只尝试一次，并用单向扫描查找结束引号，避免日志输入阻塞事件循环。
+# 与 upstream 1236f407 的 lookbehind 单正则修复等价地消除该回溯，并在其
+# 之上额外修复未闭合引号场景的明文泄露——勿回退为单正则形态。
+_NAMED_QUOTED_KV_START_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])"
+    r"(?P<prefix>[\"']?(?P<key>[A-Za-z0-9_.-]+)[\"']?\s*[:=]\s*)"
+    r"(?P<quote>[\"'])"
+)
+_NAMED_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?i)(?:token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
     r"secret[_-]?key|authorization|auth[_-]?code|auth[_-]?token|"
-    r"credential|private[_-]?key|"
-    r"user[_-]?id|userid|project[_-]?id|"
+    r"credential|private[_-]?key|user[_-]?id|userid|project[_-]?id|"
     r"amap[_-]?key|map[_-]?ak)"
-    r"[A-Za-z0-9_.-]*[\"']?\s*[:=]\s*)([\"'])(.*?)(\2)"
 )
 # 匹配 Authorization Bearer 令牌，保留 "Bearer " 前缀，仅掩码后面的令牌值。
 # 分组：1) "Bearer " 前缀；2) 令牌值本体（用于算指纹）。
@@ -2538,7 +2553,9 @@ _SENSITIVE_PATTERNS: list[re.Pattern[str]] = [
     # 匹配 GitLab Personal Access Token（glpat- 前缀）。
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
     # 匹配邮箱地址（避免日志中泄露个人身份信息）。
-    re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b"),
+    # A word boundary retries after every '+'/'%' in a long non-email run.
+    # Start only at the beginning of a complete local-part token.
+    re.compile(r"(?<![a-zA-Z0-9._%+-])[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b"),
     # 匹配中国大陆手机号（可带 +86 或 86 前缀，支持空格/短横线分隔）。
     re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"),
     # 匹配中国身份证号（18 位，最后一位可为 X/x）。
@@ -2597,7 +2614,147 @@ def _masked_with_fp(value: Any) -> str:
     return f"{_SENSITIVE_MASK}(fp:{fp})"
 
 
+def _mask_named_sensitive_kv(text: str) -> str:
+    """Mask quoted values whose key contains a sensitive keyword.
+
+    The scan advances monotonically.  In particular, a long identifier that
+    is not a quoted key/value pair is inspected once instead of being retried
+    from every character position by a backtracking regular expression.
+    The closing-quote lookup never crosses a newline: an unclosed quote masks
+    only to the end of the current line, and scanning resumes on the next
+    line so its sensitive pairs stay matchable and unrelated lines stay
+    readable.
+    """
+    chunks: list[str] = []
+    copy_from = 0
+    search_from = 0
+
+    while True:
+        match = _NAMED_QUOTED_KV_START_PATTERN.search(text, search_from)
+        if match is None:
+            break
+        search_from = match.end()
+        if _NAMED_SENSITIVE_KEY_PATTERN.search(match.group("key")) is None:
+            continue
+
+        quote = match.group("quote")
+        value_start = match.end()
+        line_end = text.find("\n", value_start)
+        if line_end < 0:
+            line_end = len(text)
+        value_end = text.find(quote, value_start, line_end)
+        if value_end < 0:
+            # A malformed quoted secret must not leak.  Mask the rest of the
+            # current line and resume after the newline instead of swallowing
+            # later lines: their quotes must remain available as value
+            # boundaries for their own sensitive keys.
+            chunks.append(text[copy_from:value_start])
+            chunks.append(_masked_with_fp(text[value_start:line_end]))
+            copy_from = line_end
+            search_from = line_end
+            continue
+
+        chunks.append(text[copy_from:value_start])
+        chunks.append(_masked_with_fp(text[value_start:value_end]))
+        chunks.append(quote)
+        copy_from = value_end + 1
+        search_from = copy_from
+
+    if not chunks:
+        return text
+    chunks.append(text[copy_from:])
+    return "".join(chunks)
+
+
 def _sanitize_log_text(text: str) -> str:
+    """Redact JSON by value, preserving numbers and valid serialization.
+
+    Metrics can contain 18 decimal digits; applying an identity-number regex to
+    serialized JSON corrupts them. Plain text retains the existing redaction.
+    """
+    decoder = json.JSONDecoder()
+    start_pattern = re.compile(r'[\{\[]')
+    chunks: list[str] = []
+    copy_from = 0
+    search_from = 0
+    candidates = 0
+    # Limit each unconsumed segment to 32 candidates, resetting after success.
+    # Scan the original text iteratively so shallow fragments do not grow the
+    # call stack or repeatedly scan and copy the remaining suffix.
+    while candidates < 32:
+        match = start_pattern.search(text, search_from)
+        if match is None:
+            break
+        start = match.start()
+        search_from = start + 1
+        candidates += 1
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(value, (dict, list)):
+            continue
+        chunks.append(_sanitize_plain_log_text(text[copy_from:start]))
+        chunks.append(
+            json.dumps(_sanitize_log_value(value), ensure_ascii=False, separators=(",", ":"))
+        )
+        copy_from = end
+        search_from = end
+        candidates = 0
+    chunks.append(_sanitize_plain_log_text(text[copy_from:]))
+    return "".join(chunks)
+
+
+_SAFE_AUTHORIZATION_OUTCOMES = ("allow", "deny", "block", "cancel")
+_TOKEN_COUNT_KEYS = frozenset(
+    {"input_tokens", "output_tokens", "total_tokens", "cached_tokens", "reasoning_tokens", "tokens_used"}
+)
+
+
+def _sanitize_log_value(value: Any, *, mask_values: bool = False) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            safe_outcome = key == "authorization_outcome" and item in _SAFE_AUTHORIZATION_OUTCOMES
+            # Reuse the existing key classifier without letting quotes/escapes in
+            # actual values change the matching boundaries.
+            sensitive = mask_values or _NAMED_SENSITIVE_KEY_PATTERN.search(str(key)) is not None
+            if key in _TOKEN_COUNT_KEYS and _is_plain_number(item):
+                sensitive = False
+            result[_sanitize_plain_log_text(str(key))] = _sanitize_log_value(
+                item, mask_values=sensitive and not safe_outcome
+            )
+        return result
+    if isinstance(value, list):
+        sanitized = []
+        for index, item in enumerate(value):
+            previous = value[index - 1] if index else None
+            flag_value = isinstance(previous, str) and _CLI_FLAG_SENSITIVE_PATTERN.fullmatch(
+                previous + " value"
+            )
+            sanitized.append(_sanitize_log_value(item, mask_values=mask_values or bool(flag_value)))
+        return sanitized
+    if mask_values:
+        return _masked_with_fp(value)
+    if isinstance(value, str):
+        return _sanitize_log_text(value)
+    if _is_plain_int(value) and any(
+        pattern.fullmatch(str(value)) for pattern in _SENSITIVE_PII_PATTERNS
+    ):
+        return _SENSITIVE_MASK
+    return value
+
+
+def _is_plain_int(value: Any) -> bool:
+    # bool is an int subclass; True/False are never token counts or identity numbers.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_plain_number(value: Any) -> bool:
+    return _is_plain_int(value) or isinstance(value, float)
+
+
+def _sanitize_plain_log_text(text: str) -> str:
     if not text:
         return text
 
@@ -2618,10 +2775,7 @@ def _sanitize_log_text(text: str) -> str:
     masked = _KV_SENSITIVE_PATTERN.sub(
         lambda m: f"{m.group(1)}{m.group(2)}{_masked_with_fp(m.group(4))}", masked
     )
-    # _NAMED_SENSITIVE_KV_PATTERN: 组1=键+分隔符, 组2=起始引号, 组3=值, 组4=结束引号。
-    masked = _NAMED_SENSITIVE_KV_PATTERN.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}{_masked_with_fp(m.group(3))}{m.group(4)}", masked
-    )
+    masked = _mask_named_sensitive_kv(masked)
     # _BEARER_SENSITIVE_PATTERN: 组1=Bearer 前缀, 组2=令牌值。
     masked = _BEARER_SENSITIVE_PATTERN.sub(
         lambda m: f"{m.group(1)}{_masked_with_fp(m.group(2))}", masked
@@ -2657,13 +2811,17 @@ class SensitiveDataFilter(logging.Filter):
     """Mask sensitive data in all log messages and tracebacks."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "jiuwen_sensitive_sanitized", False):
+            return True
+
+        sanitized = True
         try:
             message = record.getMessage()
-            record.msg = _sanitize_log_text(message)
+            record.msg = _sanitize_record_text(message)
             record.args = ()
         except Exception:
             # Never block logging because of desensitization failure.
-            pass
+            sanitized = False
 
         # Traceback 由 Formatter.formatException() 在 record.exc_text 中单独渲染，
         # 不经过 record.getMessage()，因此 message 脱敏覆盖不到。这里提前把
@@ -2681,13 +2839,15 @@ class SensitiveDataFilter(logging.Filter):
                 # 兼容层，未来版本可能移除；改用 exc_info[1]（异常实例）是
                 # 官方推荐写法，面向未来且行为等价（None 时输出 "NoneType: None"）。
                 formatted = "".join(_traceback.format_exception(exc_info[1]))
-                record.exc_text = _sanitize_log_text(formatted)
+                record.exc_text = _sanitize_record_text(formatted)
                 record.exc_info = None
             elif record.exc_text:
-                record.exc_text = _sanitize_log_text(record.exc_text)
+                record.exc_text = _sanitize_record_text(record.exc_text)
         except Exception:
             # 同样不因脱敏失败而阻断日志输出。
-            pass
+            sanitized = False
+        if sanitized:
+            record.jiuwen_sensitive_sanitized = True
         return True
 
 
@@ -2734,7 +2894,7 @@ def install_source_record_masking() -> None:
         try:
             # message 脱敏（含 %s/format 格式化后的最终文本）。
             msg = record.getMessage()
-            record.msg = _sanitize_log_text(msg)
+            record.msg = _sanitize_record_text(msg)
             record.args = ()
             # traceback 脱敏：traceback 由 Formatter.formatException 从
             # record.exc_text 单独渲染，getMessage 覆盖不到。此处提前渲染并脱敏，
@@ -2744,10 +2904,11 @@ def install_source_record_masking() -> None:
                 import traceback as _tb
 
                 formatted = "".join(_tb.format_exception(exc_info[1]))
-                record.exc_text = _sanitize_log_text(formatted)
+                record.exc_text = _sanitize_record_text(formatted)
                 record.exc_info = None
             elif record.exc_text:
-                record.exc_text = _sanitize_log_text(record.exc_text)
+                record.exc_text = _sanitize_record_text(record.exc_text)
+            record.jiuwen_sensitive_sanitized = True
         except Exception:
             # 永不因脱敏失败而阻断日志输出。但记录失败（计数 + 首次 stderr 提示），
             # 避免静默吞掉异常导致 api_key 在无感知下明文泄露。
@@ -2765,6 +2926,25 @@ def install_source_record_masking() -> None:
 
     logging.setLogRecordFactory(_sanitizing_record_factory)
     _source_record_masking_installed = True
+
+
+def _sanitize_record_text(text: str) -> str:
+    """Bound regex/JSON work per log record without truncating a credential.
+
+    Oversized payloads belong in session history rather than operational logs.
+    Omitting the whole payload also avoids breaking serialized JSON or exposing
+    a partial credential at a truncation boundary. Public mask_sensitive keeps
+    its full-text behavior.
+    """
+    if len(text) > 64 * 1024:
+        if text.lstrip().startswith(("{", "[")):
+            return json.dumps({
+                "log_payload_omitted": True,
+                "original_characters": len(text),
+                "character_limit": 64 * 1024,
+            }, separators=(",", ":"))
+        return f"[log payload omitted: {len(text)} characters exceeds 65536 character limit]"
+    return _sanitize_log_text(text)
 
 
 def _reconfigure_stdio_utf8() -> None:
@@ -2804,6 +2984,7 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     级别由 ``config.yaml`` 的 ``logging`` 段控制；环境变量 ``LOG_LEVEL`` 仅覆盖**控制台**级别
     （``log_level`` 参数为 ``None`` 时）。若传入 ``log_level``（如单测），则控制台与各文件级别均为该值。
     """
+    install_runtime_log_filter()
     # 必须在创建 StreamHandler 之前完成：cp1252 → UTF-8，否则中文日志会触发 UnicodeEncodeError。
     _reconfigure_stdio_utf8()
     logs_root = get_logs_dir()
@@ -2817,6 +2998,15 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     for handler in root.handlers[:]:
         handler.close()
         root.removeHandler(handler)
+
+    # M0-c：gateway 升为顶层包后，其模块 logger（``gateway.*``）不再位于
+    # ``jiuwenswarm`` 命名空间之下——std logging 无 reparent 机制，显式把
+    # ``gateway`` logger 挂回 ``jiuwenswarm`` 树，保持 gateway.log / 控制台
+    # 路由不变（否则 gateway 日志全部丢失）。
+    gateway_logger = logging.getLogger("gateway")
+    gateway_logger.setLevel(logging.NOTSET)
+    gateway_logger.propagate = True
+    gateway_logger.parent = root
 
     formatter = logging.Formatter(
         fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
@@ -2840,9 +3030,9 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
         )
         h.setLevel(level)
         h.setFormatter(custom_formatter if custom_formatter is not None else formatter)
-        h.addFilter(privacy_filter)
         if name_filter is not None:
             h.addFilter(name_filter)
+        h.addFilter(privacy_filter)
         root.addHandler(h)
 
     # gateway 日志独立目录（仅当环境变量 AGENTOS_GATEWAY_LOG_DIR 指定时启用），
@@ -2882,6 +3072,9 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     # 源头脱敏：覆盖 jiuwenswarm 命名空间之外的第三方 logger（openjiuwen/openai/
     # httpx 等），在 LogRecord 创建时统一脱敏，保证任何来源的 api_key 都不明文落盘。
     install_source_record_masking()
+    from jiuwenswarm.common.background_logging import wrap_log_handlers
+
+    wrap_log_handlers(root)
     return root
 
 

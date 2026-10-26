@@ -30,6 +30,7 @@ import { webClient, webRequest } from '../../../../channels/web/frontend/src/ser
 import { createRealtimeDuplexSession, RealtimeDuplexSession } from './qwenOmniSession';
 import { isVideoSourceReady, RealtimeVideoFrameScheduler, waitForFirstVideoFrame } from './videoSource';
 import { JoyAIProvider } from './joyaiProvider';
+import { describeDuplexError } from '../duplexErrorMessage';
 import {
   mergeSearchProgressJob,
   searchAwareToolStatus,
@@ -78,8 +79,11 @@ function isUsefulTranscript(text: string): boolean {
 }
 
 export interface VideoLivePanelHandle {
-  startScreenDuplex: (searchSessionId?: string) => Promise<boolean>;
+  startScreenDuplex: (searchSessionId?: string, shareScreen?: boolean, visualSource?: 'screen' | 'camera') => Promise<boolean>;
   stop: () => void;
+  setMicrophoneMuted: (muted: boolean) => void;
+  setSpeakerMuted: (muted: boolean) => void;
+  stopScreenSharing: () => void;
   deliverToolResult: (payload: SearchJobPayload) => void;
 }
 
@@ -89,11 +93,12 @@ interface VideoLivePanelProps {
   onAssistantStream?: (update: { streamId: string; content: string; final: boolean }) => void;
   onRuntimeState?: (state: 'idle' | 'starting' | 'active') => void;
   onError?: (message: string) => void;
+  onScreenSharingChange?: (sharing: boolean) => void;
   onCoreAgentProgress?: (event: 'started' | 'progress' | 'completed' | 'failed', payload: SearchJobPayload) => void;
 }
 
 export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelProps>(function VideoLivePanel(
-  { headless = false, onConversationItem, onAssistantStream, onRuntimeState, onError, onCoreAgentProgress },
+  { headless = false, onConversationItem, onAssistantStream, onRuntimeState, onError, onCoreAgentProgress, onScreenSharingChange },
   ref,
 ) {
   const { t } = useTranslation();
@@ -120,7 +125,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
   const searchJobsRef = useRef<Map<string, SearchJobState>>(new Map());
   const pollingSearchJobsRef = useRef<Set<string>>(new Set());
   const pendingScreenAutostartRef = useRef(false);
-  const hadHeadlessScreenRef = useRef(false);
+  const wasDuplexRunningRef = useRef(false);
 
   const [source, setSource] = useState<VideoSource>(null);
   const [sourceName, setSourceName] = useState('');
@@ -246,7 +251,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
     setSearchStatus('');
   };
 
-  const getJoyAIProvider = (): JoyAIProvider => {
+  const getJoyAIProvider = (replyLanguage?: VideoSessionConfig['reply_language']): JoyAIProvider => {
     const callbacks = {
       getLatestFrameDataUrl: () => framesRef.current.at(-1)?.data_url || '',
       getFrameCount: () => framesRef.current.length,
@@ -279,9 +284,10 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
       report: reportRealtimeEvent,
     };
     if (!joyaiProviderRef.current) {
-      joyaiProviderRef.current = new JoyAIProvider(callbacks);
+      joyaiProviderRef.current = new JoyAIProvider(callbacks, replyLanguage);
     } else {
       joyaiProviderRef.current.updateCallbacks(callbacks);
+      if (replyLanguage) joyaiProviderRef.current.setPreferredLanguage(replyLanguage);
     }
     return joyaiProviderRef.current;
   };
@@ -377,7 +383,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
     const callId = payload.tool_call_id?.trim() || existing?.toolCallId;
     const turnId = payload.turn_id?.trim() || existing?.turnId;
     const error = payload.error?.trim() || 'Jiuwen Core Agent failed';
-    const failureText = `Jiuwen Core Agent 未能完成任务：${error}`;
+    const failureText = describeDuplexError(error, 'task');
     if (!headless) appendChat('assistant', failureText, 'tool_result');
     if (callId) {
       duplexRef.current?.enqueueToolResult({
@@ -634,7 +640,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
     };
   }, [isPlaying, screens, source]);
 
-  const startCamera = async () => {
+  const startCamera = async (): Promise<boolean> => {
     resetSource();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -649,25 +655,36 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
         releaseSource();
         setSource(null);
         setSourceName('');
-        return;
+        return false;
       }
       video.srcObject = stream;
       video.muted = true;
       try {
         await video.play();
         setIsPlaying(true);
+        stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+          releaseSource();
+          setSource(null);
+          setSourceName('');
+        }, { once: true });
+        return true;
       } catch (playError) {
         setError(
           playError instanceof Error
             ? `摄像头已连接，但画面播放失败：${playError.message}`
             : '摄像头已连接，但画面播放失败。',
         );
+        releaseSource();
+        setSource(null);
+        setSourceName('');
+        return false;
       }
     } catch (cameraError) {
       releaseSource();
       setSource(null);
       setSourceName('');
       setError(cameraError instanceof Error ? cameraError.message : '无法打开摄像头');
+      return false;
     }
   };
 
@@ -825,7 +842,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
         });
         setModel(config.model);
         if (config.provider === 'joyai') {
-          await getJoyAIProvider().start();
+          await getJoyAIProvider(config.reply_language).start();
           return;
         }
         const videoFrames = new RealtimeVideoFrameScheduler(1_000);
@@ -834,6 +851,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
             url: config.url || '',
             voice: config.voice,
             tools: config.tools,
+            replyLanguage: config.reply_language,
           },
           {
             getVideoFrame: () => {
@@ -971,7 +989,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
                   reportRealtimeEvent('qwen_tool_call_receipt', {
                     name: call.name, call_id: call.callId, decision: 'rejected', message,
                   });
-                  setError(message);
+                  setError(describeDuplexError(message, 'task'));
                   session.enqueueOperationResult(call.callId, { state: 'rejected', error: message });
                 });
             },
@@ -1014,36 +1032,71 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
   };
 
   useEffect(() => {
-    if (!pendingScreenAutostartRef.current || source !== 'screen' || screens.length === 0 || !isPlaying) return;
-    hadHeadlessScreenRef.current = headless;
+    if (!pendingScreenAutostartRef.current || !isPlaying) return;
+    if (source !== 'camera' && (source !== 'screen' || screens.length === 0)) return;
     pendingScreenAutostartRef.current = false;
     void startRealtime();
   }, [headless, isPlaying, screens, source]);
 
   useEffect(() => {
-    if (!headless || screens.length > 0 || !hadHeadlessScreenRef.current) return;
-    hadHeadlessScreenRef.current = false;
-    stopRealtime();
-  }, [headless, screens.length]);
+    if (!isRecording && !isRealtimeStarting) return;
+    return webClient.onStateChange((state) => {
+      if (state !== 'closed' && state !== 'reconnecting') return;
+      setError((previous) => previous || 'Jiuwen 服务连接已断开，未提供具体原因。请检查网络或本地服务后重新启动全双工。');
+      stopRealtime();
+    });
+  }, [isRecording, isRealtimeStarting]);
 
   useEffect(() => {
+    const running = isRealtimeStarting || isRecording;
+    if (headless && wasDuplexRunningRef.current && !running) {
+      releaseScreens();
+      releaseSource();
+      setSource(null);
+      setSourceName('');
+    }
+    wasDuplexRunningRef.current = running;
     onRuntimeState?.(isRealtimeStarting ? 'starting' : isRecording ? 'active' : 'idle');
-  }, [isRealtimeStarting, isRecording, onRuntimeState]);
+  }, [headless, isRealtimeStarting, isRecording, onRuntimeState, releaseScreens, releaseSource]);
 
   useEffect(() => {
-    if (error) onError?.(error);
+    if (error) onError?.(describeDuplexError(error));
   }, [error, onError]);
 
+  useEffect(() => {
+    onScreenSharingChange?.(screens.length > 0 || source === 'camera');
+  }, [screens.length, source, onScreenSharingChange]);
+
   useImperativeHandle(ref, () => ({
-    startScreenDuplex: async (searchSessionId) => {
+    startScreenDuplex: async (searchSessionId, shareScreen = true, visualSource = 'screen') => {
       conversationSearchSessionRef.current = searchSessionId || '';
-      const started = await startScreen();
+      if (!shareScreen) {
+        await startRealtime();
+        return Boolean(duplexRef.current || joyaiProviderRef.current?.active);
+      }
+      const started = visualSource === 'camera' ? await startCamera() : await startScreen();
       pendingScreenAutostartRef.current = started;
       return started;
     },
     stop: () => {
       pendingScreenAutostartRef.current = false;
       resetSource();
+    },
+    setMicrophoneMuted: (muted) => {
+      duplexRef.current?.setMicrophoneMuted(muted);
+      joyaiProviderRef.current?.setMicrophoneMuted(muted);
+    },
+    setSpeakerMuted: (muted) => {
+      duplexRef.current?.setSpeakerMuted(muted);
+      joyaiProviderRef.current?.setSpeakerMuted(muted);
+    },
+    stopScreenSharing: () => {
+      [...screenStreamsRef.current.keys()].forEach(removeScreen);
+      if (cameraStreamRef.current) {
+        releaseSource();
+        setSource(null);
+        setSourceName('');
+      }
     },
     deliverToolResult: (payload) => {
       if (!searchSessionRef.current || payload.search_session_id !== searchSessionRef.current) return;
@@ -1294,7 +1347,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
             )}
           </div>
 
-          {error && <div className="video-live__error">{error}</div>}
+          {error && <div className="video-live__error" data-testid="video-live-error-message" role="alert">{describeDuplexError(error)}</div>}
           {realtimeStatus && <div className="video-live__realtime-status">{realtimeStatus}</div>}
           {visibleSearchProgress && (
             <div className={`video-live__search-progress is-${visibleSearchProgress.status}`}>
@@ -1383,6 +1436,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
             <button
               type="button"
               className={`video-live__mic${isRecording ? ' is-recording' : ''}`}
+              data-testid="video-live-session-toggle"
               onClick={isRecording ? stopRealtime : () => void startRealtime()}
               disabled={isRealtimeStarting && !isRecording}
               aria-label={

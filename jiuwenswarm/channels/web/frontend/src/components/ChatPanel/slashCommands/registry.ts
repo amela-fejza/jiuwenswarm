@@ -8,7 +8,7 @@ import { NEW_CONVERSATION_ID } from '../../../multi-session/state/newConversatio
 import { resolvePlanGoalInterlock } from './semantics';
 
 /**
- * 斜杠命令注册表（/new、/fork、/side、/compact、/plan、/goal、/persist）。
+ * 斜杠命令注册表（/fork、/compact、/plan、/goal、/persist）。
  * 后端与 TUI 共用 agent_ws_server；命令结果以 system 消息留痕，
  * 第一行回显命令行，MessageItem 按 isCommandOutput 渲染。
  */
@@ -22,9 +22,7 @@ export type SlashCommandContext = {
   inputLine: string;
   addMessage: (sessionId: string, message: Message) => void;
   submitMessage?: (content: string) => void;
-  startNewConversation: () => void;
   forkConversation: (sourceSessionId: string) => Promise<void>;
-  startSideConversation: (sourceSessionId: string, prompt?: string) => Promise<void>;
   runGoalAction: (
     sessionId: string,
     action: GoalSlashAction,
@@ -80,7 +78,8 @@ export type GoalSlashIntent =
 export type GoalSetPreparationResult =
   | 'ready'
   | 'confirm_overwrite'
-  | 'blocked_by_plan';
+  | 'blocked_by_plan'
+  | 'blocked_by_busy';
 
 export type PlanSlashToggleResult =
   | 'activated'
@@ -137,13 +136,23 @@ export function parseGoalSlashArgs(args: string): GoalSlashIntent {
   return { action: 'set', objective: normalizedArgs };
 }
 
-/** Apply the same Goal/Plan interlock used by the composer toolbar. */
+/**
+ * Apply the same Goal/Plan interlock used by the composer toolbar.
+ *
+ * 会话进行中 / 暂停 / 等待 ask_user 回答时不允许 `/goal set`——与 `evaluateGoalArm`
+ * 打开方向、`/plan` 的 `togglePlanFromSlash` 共用同一套 planModeGate 忙态判断
+ * （bugfix 2026092401 bug001：任务执行中仍可 `/goal set <目标>` 直接设目标，
+ * 与「执行期间禁用目标模式」的要求不一致）。忙态检查放在最前：会话忙时直接拦，
+ * 不再先弹"覆盖确认"再问了个寂寞。默认参数便于单测注入。
+ */
 export function prepareGoalSetFromSlash(
   sessionId: string,
   overwriteConfirmed = false,
   planStore: GoalPlanSlashStore = usePlanStore.getState(),
   goalStore: GoalSlashStore = useGoalStore.getState(),
+  sessionBusy: boolean = isSessionBusyForPlanToggle(sessionId),
 ): GoalSetPreparationResult {
+  if (sessionBusy) return 'blocked_by_busy';
   const currentGoal = goalStore.getRuntime(sessionId)?.goal;
   if (currentGoal && currentGoal.status !== 'completed' && !overwriteConfirmed) {
     return 'confirm_overwrite';
@@ -190,15 +199,6 @@ function commandResultMessage(inputLine: string, output: string): Message {
   };
 }
 
-/** /new —— 复用 App 的新建会话入口；真实 session 在首条消息发送时再创建。 */
-const newCommand: SlashCommand = {
-  name: 'new',
-  requiresSession: false,
-  execute: async (ctx) => {
-    ctx.startNewConversation();
-  },
-};
-
 /** /fork —— 复制当前会话，并复用 App 的会话恢复流程切换到副本。 */
 const forkCommand: SlashCommand = {
   name: 'fork',
@@ -207,18 +207,6 @@ const forkCommand: SlashCommand = {
       await ctx.forkConversation(ctx.sessionId);
     } catch {
       ctx.addMessage(ctx.sessionId, commandResultMessage(ctx.inputLine, '分叉会话失败，请稍后再试。'));
-    }
-  },
-};
-
-/** /side —— 从当前上下文创建不进入普通历史列表的临时侧会话。 */
-const sideCommand: SlashCommand = {
-  name: 'side',
-  execute: async (ctx, args) => {
-    try {
-      await ctx.startSideConversation(ctx.sessionId, args.trim() || undefined);
-    } catch {
-      ctx.addMessage(ctx.sessionId, commandResultMessage(ctx.inputLine, '创建临时侧会话失败，请稍后再试。'));
     }
   },
 };
@@ -350,6 +338,13 @@ const goalCommand: SlashCommand = {
           if (!confirmed) return;
           preparation = prepareGoalSetFromSlash(ctx.sessionId, true);
         }
+        if (preparation === 'blocked_by_busy') {
+          ctx.addMessage(
+            ctx.sessionId,
+            commandResultMessage(ctx.inputLine, '对话进行中，暂时无法设置目标，请等待执行结束。'),
+          );
+          return;
+        }
         if (preparation === 'blocked_by_plan') {
           ctx.addMessage(
             ctx.sessionId,
@@ -417,9 +412,7 @@ const persistCommand: SlashCommand = {
 };
 
 export const SLASH_COMMANDS: SlashCommand[] = [
-  newCommand,
   forkCommand,
-  sideCommand,
   compactCommand,
   planCommand,
   goalCommand,

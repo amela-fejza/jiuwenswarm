@@ -19,7 +19,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Generic, Protocol, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeAlias, TypeVar
 from weakref import WeakValueDictionary
 
 from jiuwenswarm.runtime.session_delete import (
@@ -136,6 +136,8 @@ class SessionCreateInput:
     title: str = ""
     user_id: str = ""
     model_name: str = ""
+    model_selection: dict[str, Any] | None = None
+    moa_enabled: bool | None = None
     cron_id: str = ""
 
     def __post_init__(self) -> None:
@@ -143,6 +145,10 @@ class SessionCreateInput:
         _require_bool("persist_session_supplied", self.persist_session_supplied)
         _require_bool("is_swarm", self.is_swarm)
         _require_bool("team_hint", self.team_hint)
+        _require_optional_bool("moa_enabled", self.moa_enabled)
+        if self.model_selection is not None:
+            from jiuwenswarm.common.model_selection import ModelSelection
+            ModelSelection.model_validate(self.model_selection)
         _require_optional_bool("work_mode_explicit", self.work_mode_explicit)
 
 
@@ -173,10 +179,7 @@ class SessionForkInput:
     cutoff_role: str = ""
     cutoff_content: str = ""
     cutoff_timestamp: float | str | None = None
-    side_conversation: bool = False
-
-    def __post_init__(self) -> None:
-        _require_bool("side_conversation", self.side_conversation)
+    session_equipment_override: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -194,6 +197,7 @@ class SessionCreateResult:
     created: bool
     canonical_mode: str
     explicit_id_compatibility: bool = False
+    moa_enabled: bool = False
 
     def __post_init__(self) -> None:
         _require_bool("persist_session", self.persist_session)
@@ -213,6 +217,7 @@ class SessionSwitchResult:
     session_id: str
     mode: str
     switched: bool = True
+    moa_enabled: bool = False
 
     def __post_init__(self) -> None:
         _require_bool("switched", self.switched)
@@ -226,10 +231,7 @@ class SessionForkResult:
     source_session_id: str
     session_id: str
     title: str
-    ephemeral: bool = False
-
-    def __post_init__(self) -> None:
-        _require_bool("ephemeral", self.ephemeral)
+    moa_enabled: bool = False
 
 
 SessionProvisionInput: TypeAlias = (
@@ -531,6 +533,8 @@ class RuntimeSessionProvisioner:
         self._agent_manager = agent_manager
         self._plan_controller = plan_controller
         self._delete_lifecycle = delete_lifecycle
+        self._prepared_session_deletes: dict[str, SessionDeleteLifecycle] = {}
+        self._pending_session_delete_metadata: dict[str, dict[str, Any]] = {}
         self._participant_registry = (
             participant_registry or RuntimeParticipantRegistry()
         )
@@ -546,7 +550,32 @@ class RuntimeSessionProvisioner:
         lifecycle: SessionDeleteLifecycle | None,
     ) -> None:
         """Replace the optional lifecycle participant owned by the host."""
+        if lifecycle is not self._delete_lifecycle:
+            # The host owns stopping the old runtime. Its preparation cannot
+            # release resources retained by the replacement runtime on retry.
+            self._prepared_session_deletes.clear()
         self._delete_lifecycle = lifecycle
+
+    async def prepare_session_delete(self, session_id: str) -> None:
+        """Prepare once before the lifecycle service drains retained adapters."""
+        async with session_delete_lock(session_id):
+            lifecycle = self._prepared_session_deletes.get(
+                session_id, self._delete_lifecycle
+            )
+            if lifecycle is None:
+                return
+            # Checkpoint initialization belongs to delete_session, after the
+            # drain. This early stage only releases heartbeat retention.
+            await self._ensure_delete_lifecycle_started(lifecycle)
+            await self._prepare_delete_lifecycle(session_id, lifecycle)
+
+    async def _prepare_delete_lifecycle(
+        self, session_id: str, lifecycle: SessionDeleteLifecycle
+    ) -> None:
+        if self._prepared_session_deletes.get(session_id) is not lifecycle:
+            await lifecycle.begin_session_delete(session_id)
+            if lifecycle is self._delete_lifecycle:
+                self._prepared_session_deletes[session_id] = lifecycle
 
     async def prepare_session_create(
         self,
@@ -731,8 +760,29 @@ class RuntimeSessionProvisioner:
             )
             canonical_mode = resolved.canonical_mode
             is_swarm = provision_input.is_swarm or resolved.is_team
+            from jiuwenswarm.common.config import get_config
+            from jiuwenswarm.common.model_selection import ModelSelection
+            from jiuwenswarm.server.runtime.moa_runtime import effective_moa_enabled, resolve_moa_settings
+
+            raw_selection = provision_input.model_selection or existing_metadata.get("model_selection")
+            selection = ModelSelection.model_validate(raw_selection) if raw_selection is not None else None
+            try:
+                if provision_input.cron_id and selection is not None:
+                    from jiuwenswarm.server.runtime.model_routing_registry import ModelSelectionResolver
+
+                    selection = ModelSelectionResolver().restore(selection)
+                config_snapshot = get_config()
+                moa_enabled = effective_moa_enabled(
+                    config_snapshot, selection, mode=canonical_mode,
+                    is_cron=bool(provision_input.cron_id),
+                )
+                if moa_enabled:
+                    resolve_moa_settings(config_snapshot, selection)
+            except (ValueError, RuntimeError) as exc:
+                raise SessionProvisionError(str(exc), code=getattr(exc, "code", "BAD_REQUEST")) from exc
             prewarm_eligible = (
                 not is_swarm
+                and not moa_enabled
                 and canonical_mode
                 in {
                     "agent",
@@ -761,6 +811,7 @@ class RuntimeSessionProvisioner:
                     persist_session=persist_session,
                     prewarm_eligible=prewarm_eligible,
                     create_token=create_token,
+                    **({"moa_enabled": True} if moa_enabled else {}),
                 )
                 session_id = claim.session_id
                 claimed_session_id = session_id
@@ -786,6 +837,7 @@ class RuntimeSessionProvisioner:
                     prewarm_status=prewarm_status,
                     created=False,
                     canonical_mode=canonical_mode,
+                    moa_enabled=stored.get("moa_enabled") is True,
                 )
                 return self._stage_create_result(
                     result,
@@ -817,12 +869,17 @@ class RuntimeSessionProvisioner:
                     persist_session=persist_session,
                     work_mode=final_work_mode,
                     model=str(provision_input.model_name or "").strip(),
+                    moa_enabled=moa_enabled,
                     cron_id=str(provision_input.cron_id or "").strip(),
                     channel_metadata=channel_metadata,
                 )
                 if not explicit_tui_session:
                     self._agent_manager.activate_session_prewarm(session_id)
 
+            if provision_input.model_selection is not None:
+                from jiuwenswarm.server.runtime.session.model_selection_store import set_session_model_selection
+
+                set_session_model_selection(session_id, selection)
             switch_context, dispatch_signals = await self._prepare_create_owner(
                 channel_id=channel_id,
                 session_id=session_id,
@@ -841,6 +898,7 @@ class RuntimeSessionProvisioner:
                 created=session_created,
                 canonical_mode=canonical_mode,
                 explicit_id_compatibility=explicit_tui_session,
+                moa_enabled=moa_enabled,
             )
             return self._stage_create_result(
                 result,
@@ -1177,6 +1235,7 @@ class RuntimeSessionProvisioner:
             channel_id=channel_id,
             session_id=target_session_id,
             mode=resolved_mode,
+            moa_enabled=target_metadata.get("moa_enabled") is True,
         )
         return self._stage_session_provision(
             result,
@@ -1206,7 +1265,6 @@ class RuntimeSessionProvisioner:
         cutoff_role = str(provision_input.cutoff_role or "").strip()
         cutoff_content = str(provision_input.cutoff_content or "")
         cutoff_timestamp = provision_input.cutoff_timestamp
-        side_conversation = provision_input.side_conversation
         has_message_cutoff = bool(
             cutoff_message_id
             or cutoff_role
@@ -1239,8 +1297,6 @@ class RuntimeSessionProvisioner:
                 "title": title,
                 "channel_id": channel_id,
             }
-            if side_conversation:
-                fork_kwargs["side_conversation"] = True
             if has_message_cutoff:
                 fork_kwargs.update(
                     {
@@ -1250,6 +1306,8 @@ class RuntimeSessionProvisioner:
                         "cutoff_timestamp": cutoff_timestamp,
                     }
                 )
+            if provision_input.session_equipment_override is not None:
+                fork_kwargs["session_equipment_override"] = provision_input.session_equipment_override
             fork_result = fork_session(
                 **fork_kwargs,
             )
@@ -1266,19 +1324,11 @@ class RuntimeSessionProvisioner:
                         force_history=True,
                     )
                 else:
-                    if side_conversation:
-                        await copy_session_context(
-                            deep_agent,
-                            source_session_id,
-                            target_session_id,
-                            side_conversation=True,
-                        )
-                    else:
-                        await copy_session_context(
-                            deep_agent,
-                            source_session_id,
-                            target_session_id,
-                        )
+                    await copy_session_context(
+                        deep_agent,
+                        source_session_id,
+                        target_session_id,
+                    )
             else:
                 logger.warning(
                     "session.fork: no agent for channel %s; "
@@ -1288,7 +1338,7 @@ class RuntimeSessionProvisioner:
 
             from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 
-            if not has_message_cutoff and not side_conversation:
+            if not has_message_cutoff:
                 await copy_session_state(
                     source_session_id=source_session_id,
                     target_session_id=target_session_id,
@@ -1312,7 +1362,7 @@ class RuntimeSessionProvisioner:
             ),
             session_id=str(fork_result.get("session_id") or target_session_id),
             title=str(fork_result.get("title") or ""),
-            ephemeral=bool(fork_result.get("ephemeral")),
+            moa_enabled=fork_result.get("moa_enabled") is True,
         )
         return self._stage_session_provision(
             result,
@@ -1440,7 +1490,8 @@ class RuntimeSessionProvisioner:
             delete_operation.get("kind") == "delete"
             and delete_operation.get("status") != "completed"
         )
-        if not session_dir.exists() and not recovering_delete:
+        commit_pending = target in self._pending_session_delete_metadata
+        if not session_dir.exists() and not (recovering_delete or commit_pending):
             completed = self._completed_session_deletes.get(target)
             if completed is not None:
                 return completed
@@ -1460,7 +1511,9 @@ class RuntimeSessionProvisioner:
         # replaces this dependency while constructing/rebuilding Runtime, but
         # taking a snapshot also prevents a concurrent host reconfiguration
         # from pairing one lifecycle's begin with another one's abort/commit.
-        delete_lifecycle = self._delete_lifecycle
+        delete_lifecycle = self._prepared_session_deletes.get(
+            target, self._delete_lifecycle
+        )
         checkpoint_error = await self._ensure_delete_dependencies(
             target,
             delete_lifecycle=delete_lifecycle,
@@ -1473,8 +1526,10 @@ class RuntimeSessionProvisioner:
             get_session_metadata,
         )
 
-        metadata = get_session_metadata(target) or delete_operation.get(
-            "delete_metadata", {}
+        metadata = (
+            get_session_metadata(target)
+            or delete_operation.get("delete_metadata")
+            or self._pending_session_delete_metadata.get(target, {})
         )
         if recovering_delete and not delete_operation.get("delete_metadata"):
             lifecycle_update("session", target, delete_metadata=metadata)
@@ -1542,10 +1597,10 @@ class RuntimeSessionProvisioner:
             await asyncio.to_thread(begin_trajectory_session_delete, target)
             trajectory_prepared = True
             if delete_lifecycle is not None:
-                await delete_lifecycle.begin_session_delete(target)
+                await self._prepare_delete_lifecycle(target, delete_lifecycle)
                 lifecycle_prepared = True
 
-            if not session_dir.exists() and recovering_delete:
+            if not session_dir.exists() and (recovering_delete or commit_pending):
                 deleted = True
             elif is_team_session:
                 if team_controller is None:
@@ -1642,6 +1697,9 @@ class RuntimeSessionProvisioner:
                 destructive_started=destructive_started,
             )
 
+        # Direct Runtime callers have no persisted lifecycle operation. Keep
+        # the identity needed to retry finalization after its directory is gone.
+        self._pending_session_delete_metadata[target] = metadata
         try:
             await self._commit_delete_observers(
                 result,
@@ -1693,6 +1751,7 @@ class RuntimeSessionProvisioner:
             delete_target,
         )
         self._completed_session_deletes[target] = committed_result
+        self._pending_session_delete_metadata.pop(target, None)
         return committed_result
 
     async def delete_team(
@@ -1863,6 +1922,12 @@ class RuntimeSessionProvisioner:
         operations: list[
             tuple[SessionDeleteResult, SessionLifecycleTarget, tuple[object, ...]]
         ] = []
+        # Each member keeps the participant that prepared it, even if the host
+        # replaces its runtime while this transaction awaits a controller.
+        delete_lifecycles = {
+            sid: self._prepared_session_deletes.get(sid, self._delete_lifecycle)
+            for sid in session_ids
+        }
         lifecycle_prepared: set[str] = set()
         destructive_started = False
         try:
@@ -1914,8 +1979,11 @@ class RuntimeSessionProvisioner:
                 operations.append((result, target, tuple(entered)))
 
             for result, target, _entered in operations:
-                if self._delete_lifecycle is not None:
-                    await self._delete_lifecycle.begin_session_delete(result.session_id)
+                lifecycle = delete_lifecycles[result.session_id]
+                if lifecycle is not None:
+                    await self._prepare_delete_lifecycle(
+                        result.session_id, lifecycle
+                    )
                     lifecycle_prepared.add(result.session_id)
                 await controller.quiesce_for_delete(target, reason="team.delete: ")
 
@@ -1945,7 +2013,7 @@ class RuntimeSessionProvisioner:
                         result,
                         trajectory_prepared=False,
                         lifecycle_prepared=True,
-                        delete_lifecycle=self._delete_lifecycle,
+                        delete_lifecycle=delete_lifecycles[result.session_id],
                         destructive_started=False,
                     )
                 await self._notify_delete_failed(
@@ -1977,9 +2045,12 @@ class RuntimeSessionProvisioner:
             try:
                 if session_dir.exists():
                     shutil.rmtree(session_dir)
-                if self._delete_lifecycle is not None:
-                    await self._delete_lifecycle.commit_session_delete(
-                        result.session_id
+                if result.session_id in lifecycle_prepared:
+                    await self._commit_delete_observers(
+                        result,
+                        trajectory_prepared=False,
+                        lifecycle_prepared=True,
+                        delete_lifecycle=delete_lifecycles[result.session_id],
                     )
                 committed = SessionDeleteResult(
                     ok=True,
@@ -2098,6 +2169,13 @@ class RuntimeSessionProvisioner:
                 message="persistent checkpointer is unavailable",
             )
 
+        await self._ensure_delete_lifecycle_started(delete_lifecycle)
+        return None
+
+    @staticmethod
+    async def _ensure_delete_lifecycle_started(
+        delete_lifecycle: SessionDeleteLifecycle | None,
+    ) -> None:
         if delete_lifecycle is None or bool(
             getattr(delete_lifecycle, "is_available", True)
         ):
@@ -2175,11 +2253,19 @@ class RuntimeSessionProvisioner:
                     exc,
                 )
         if lifecycle_prepared and delete_lifecycle is not None:
+            from jiuwenswarm.server.runtime.session.lifecycle import session_delete_pending
+
+            # A failed product delete remains blocked and will be retried. Keep
+            # its prepared heartbeat fence until that operation commits.
+            if session_delete_pending(result.session_id):
+                return
             try:
                 await delete_lifecycle.abort_session_delete(
                     result.session_id,
                     channel_id=result.channel_id or "",
                 )
+                if self._prepared_session_deletes.get(result.session_id) is delete_lifecycle:
+                    self._prepared_session_deletes.pop(result.session_id, None)
             except Exception as exc:  # noqa: BLE001 - preserve primary failure
                 logger.warning(
                     "Runtime Session delete lifecycle rollback failed: "
@@ -2276,6 +2362,8 @@ class RuntimeSessionProvisioner:
                 await delete_lifecycle.commit_session_delete(
                     result.session_id,
                 )
+                if self._prepared_session_deletes.get(result.session_id) is delete_lifecycle:
+                    self._prepared_session_deletes.pop(result.session_id, None)
             except Exception as exc:  # noqa: BLE001 - deletion already committed
                 logger.warning(
                     "Runtime Session delete lifecycle commit failed: "

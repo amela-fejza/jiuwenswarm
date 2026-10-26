@@ -6,6 +6,7 @@ import { normalizeFinalContent } from '../utils/finalContent';
 import { mergeFileDownloadItems } from '../utils/fileDownloadDedup';
 import { parseTimestampToMs, timestampMsToIso } from '../utils/timestamp';
 import { extractAutomation } from '../utils/heartbeatAutomation';
+import { proactiveAssistantMessageId } from '../utils/proactiveRecommendation';
 import {
   crossSessionAssistantMessageId,
   crossSessionUserMessageId,
@@ -20,6 +21,8 @@ import {
   isGoalCompletedContent,
 } from '../components/GoalBar/goalCompletedMessage';
 import { HistoryRecordReassembler } from './historyRecordReassembler';
+import { expertTeamId } from './teamOrganization/conversation';
+import { isTeamOrganizationUiEnabled } from './teamOrganization/featureConfig';
 import { readAgentTemplateName } from './agentIdentity';
 import {
   isSingleAgentContextUsageSnapshot,
@@ -1035,6 +1038,32 @@ function parseHistoryTimelineEntry(
   sessionId: string,
   subagentId?: string,
 ): HistoryTimelineEntry | null {
+  const payload = buildEventPayloadForRecord(record);
+  const teamId = expertTeamId({ ...payload, ...record }, sessionId);
+  if (teamId && !isTeamOrganizationUiEnabled()) return null;
+  const expertTeammate = Boolean(teamId && isTeamTeammateMessageRecord(record));
+  const entry = parseSessionHistoryTimelineEntry(
+    expertTeammate ? { ...record, role: 'assistant' } : record,
+    sessionId,
+    subagentId,
+  );
+  if (teamId && entry) {
+    // Expert history never replays tools or lifecycle into the owner's runtime.
+    if (entry.kind !== 'message') return null;
+    entry.message.teamId = teamId;
+    if (expertTeammate && record.event_type === 'chat.final') {
+      entry.message.id = `team-member-${String(payload.member_name ?? '')}@${entry.message.id}`;
+      entry.message.content = normalizeFinalContent(payload);
+    }
+  }
+  return entry;
+}
+
+function parseSessionHistoryTimelineEntry(
+  record: Record<string, unknown>,
+  sessionId: string,
+  subagentId?: string,
+): HistoryTimelineEntry | null {
   const eventPayload = buildEventPayloadForRecord(record);
   if ((isSuppressedOutput(record) || isSuppressedOutput(eventPayload)) && record.event_type !== 'chat.tool_result') return null;
   const role = normalizeHistoryRole(record.role);
@@ -1042,6 +1071,8 @@ function parseHistoryTimelineEntry(
   const forkedFromSessionId = readForkSourceSessionId(record);
 
   if (role === 'user') {
+    const userEventType = typeof record.event_type === 'string' ? record.event_type.trim() : '';
+    if (userEventType.startsWith('design.')) return null;
     const rawContent = record.content ?? record.text ?? record.body;
     if (isA2UIClientEventContent(rawContent)) {
       return null;
@@ -1243,7 +1274,9 @@ function parseHistoryTimelineEntry(
       extractCrossSessionMessage(payload) ?? extractCrossSessionMessage(record);
     const id = assistantCrossSession
       ? crossSessionAssistantMessageId(record.request_id, assistantCrossSession.messageId)
-      : restoredId;
+      : isProactiveRecommendation && histProactiveRecId
+        ? proactiveAssistantMessageId(histProactiveRecId)
+        : restoredId;
     // completed_at：收尾时刻（耗时）；timestamp 已是气泡出现/首包时刻（排序）
     const completedAt =
       (typeof record.completed_at === 'number' || typeof record.completed_at === 'string'
@@ -1673,16 +1706,21 @@ function buildAnsweredQaSummaryMessage(
   const items = (pending.questions ?? []).map((q) => {
     const ans = answerByQuestion.get(q.question);
     const answerTexts: string[] = [];
+    const answerSources: Array<'option' | 'input'> = [];
     if (ans) {
       for (const opt of ans.selected_options ?? []) {
-        if (opt.trim()) answerTexts.push(opt);
+        if (opt.trim()) {
+          answerTexts.push(opt);
+          answerSources.push('option');
+        }
       }
       if (ans.custom_input && ans.custom_input.trim()) {
         answerTexts.push(ans.custom_input);
+        answerSources.push('input');
       }
     }
     const header = q.header && q.header.trim() ? q.header : undefined;
-    return { header, question: q.question, answers: answerTexts };
+    return { header, question: q.question, answers: answerTexts, answerSources };
   });
   if (items.length === 0) {
     return null;

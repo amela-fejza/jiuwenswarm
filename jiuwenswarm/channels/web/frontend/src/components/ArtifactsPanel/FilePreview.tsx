@@ -7,6 +7,7 @@ import { DocxPreview } from './DocxPreview';
 import { PresentationPreview } from './PresentationPreview';
 import { SpreadsheetPreview } from './SpreadsheetPreview';
 import {
+  HTML_PREVIEW_SANDBOX,
   artifactBinaryPreviewUrl,
   artifactTextPreviewUrl,
   formatArtifactPreviewText,
@@ -115,7 +116,7 @@ export function FilePreview({
         <iframe
           title={artifact.name}
           src={url}
-          sandbox=""
+          sandbox={HTML_PREVIEW_SANDBOX}
           className="block h-full min-h-full w-full border-0 bg-transparent"
           data-testid="artifact-html-preview"
         />

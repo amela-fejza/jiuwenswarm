@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from jiuwenswarm.common.client.agent_client import AgentServerClient
+from jiuwenswarm.extensions.sdk.agent_server_client import AgentServerClientExtension
+from jiuwenswarm.extensions.sdk.third_agent import ThirdAgentExtension
+from jiuwenswarm.common.client.third_agent import ThirdAgent
+
 from jiuwenswarm.common.config import get_config
 from jiuwenswarm.extensions.agentos.agentos_router.agent_manager import AgentManager
 from jiuwenswarm.extensions.agentos.agentos_router.agentos_authenticator import AgentOSAuthenticator
@@ -14,15 +19,9 @@ from jiuwenswarm.extensions.agentos.agentos_router.registry_client import Regist
 from jiuwenswarm.extensions.agentos.agentos_router.router_client import AgentOSRouterClient
 from jiuwenswarm.extensions.agentos.agentos_router.ssh_relay import YuanrongSshRelay
 from jiuwenswarm.extensions.agentos.agentos_router.third_agent import AgentOSThirdAgent
-from jiuwenswarm.extensions.sdk.agent_server_client import (
-    AgentServerClientExtension,
-)
-from jiuwenswarm.extensions.sdk.third_agent import ThirdAgentExtension
 from jiuwenswarm.extensions.yuanrong_frontend_client import (
     YuanrongFrontendAgentClient,
 )
-from jiuwenswarm.gateway.routing.agent_client import AgentServerClient
-from jiuwenswarm.gateway.routing.third_agent import ThirdAgent
 
 
 class AgentOSRouter(AgentServerClientExtension, ThirdAgentExtension):
@@ -58,6 +57,11 @@ class AgentOSRouter(AgentServerClientExtension, ThirdAgentExtension):
             ssh_channel_endpoint=config.ssh_channel,
             workspace_root=config.workspace_root,
             sandbox_idle_timeout_seconds=config.sandbox_idle_timeout_seconds,
+            agent_sandbox_cpu=config.agent_sandbox_cpu,
+            agent_sandbox_memory=config.agent_sandbox_memory,
+            tool_sandbox_idle_timeout_seconds=config.tool_sandbox_idle_timeout_seconds,
+            tool_sandbox_cpu=config.tool_sandbox_cpu,
+            tool_sandbox_memory=config.tool_sandbox_memory,
             sandbox_idle_check_interval_seconds=(
                 config.sandbox_idle_check_interval_seconds
             ),
@@ -79,6 +83,23 @@ class AgentOSRouter(AgentServerClientExtension, ThirdAgentExtension):
 
     def get_third_agent(self) -> ThirdAgent:
         return self._third_agent
+
+    async def resolve_web_endpoint(
+        self,
+        user_id: str,
+        agent_type: str,
+        protocol: str,
+        *,
+        acquire: bool = False,
+    ) -> str | None:
+        """Delegate to router client for the WebChannel agent UI proxy."""
+        return await self._router_client.resolve_web_endpoint(
+            user_id, agent_type, protocol, acquire=acquire
+        )
+
+    async def release_web_endpoint(self, user_id: str, agent_type: str) -> None:
+        """Drop one web-proxy task hold taken by ``resolve_web_endpoint``."""
+        await self._router_client.release_web_endpoint(user_id, agent_type)
 
     def set_key_issuer(
         self,

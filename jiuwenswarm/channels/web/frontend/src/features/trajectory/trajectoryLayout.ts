@@ -1,5 +1,3 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-
 /** Deterministic sizing rules for the raw OTel inspector. */
 
 export const RAW_INSPECTOR_DEFAULT_HEIGHT = 220;
@@ -20,7 +18,7 @@ export function shouldInsetTrajectoryForFloatingTasks(
   taskPanelExpanded: boolean,
 ): boolean {
   return (mode === 'agent' || mode === 'team')
-    && activeView === 'trajectory'
+    && (activeView === 'trajectory' || activeView === 'diagnosis')
     && taskPanelAvailable
     && !taskPanelHidden
     && !taskPanelExpanded;

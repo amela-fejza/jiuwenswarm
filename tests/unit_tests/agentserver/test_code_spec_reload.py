@@ -162,7 +162,7 @@ async def test_code_reload_resolves_and_applies_spec_without_replacing_agent(
 
 
 @pytest.mark.asyncio
-async def test_code_multimodal_reload_preserves_snapshot_without_registering_tools(
+async def test_code_multimodal_reload_syncs_only_configured_tools(
     monkeypatch: pytest.MonkeyPatch,
 ):
     adapter = JiuwenSwarmCodeAdapter()
@@ -171,11 +171,23 @@ async def test_code_multimodal_reload_preserves_snapshot_without_registering_too
     adapter._audio_model_config = object()
     adapter._video_model_config = True
     adapter._image_gen_model_config = True
-    config_base = {"react": {"agent_name": "code"}}
+    config_base = {
+        "react": {"agent_name": "code"},
+        "modes": {"code": {"tools": ["visual_question_answering"]}},
+    }
     env_overrides = {}
-    refresh = AsyncMock(return_value=config_base)
+    async def refresh_snapshot(config, overrides):
+        adapter._config_base_cache = config
+        return config
+
+    refresh = AsyncMock(side_effect=refresh_snapshot)
     fan_out = AsyncMock()
-    sync_group = MagicMock()
+    synced = []
+
+    def sync_group(**kwargs):
+        synced.append((kwargs["warn_label"], kwargs["enabled"]))
+        return [], False
+
     monkeypatch.setattr(adapter, "_apply_multimodal_reload_snapshot", refresh)
     monkeypatch.setattr(adapter, "_fan_out_reload_to_session_adapters", fan_out)
     monkeypatch.setattr(adapter, "_sync_tool_group", sync_group)
@@ -192,7 +204,11 @@ async def test_code_multimodal_reload_preserves_snapshot_without_registering_too
         {"multimodal"},
         permission_notification=False,
     )
-    sync_group.assert_not_called()
+    assert synced == [
+        ("Code vision tools", True),
+        ("Code audio transcription tool", False),
+        ("Code video understanding tool", False),
+    ]
     assert not adapter._vision_tools
     assert not adapter._audio_tools
 
@@ -228,6 +244,12 @@ async def test_code_reload_rolls_back_spec_rails_when_apply_fails(
     adapter._last_models_config_fingerprint = "old-fingerprint"
     adapter._model_cache = {"old-model": old_model}
     adapter._model_name_to_keys = {"old-model": ["old-model"]}
+    adapter._model_recipes = {"old-model": {"model_id": "old-id"}}
+    adapter._model_alias_to_key = {"old-alias": "old-model"}
+    adapter._global_index_to_cache_key = {1: "old-model"}
+    adapter._model_id_to_key = {"old-id": "old-model"}
+    adapter._model_group_cache = {"old-group": old_model}
+    adapter._kernel_identity = "old-kernel"
     template_state = ("template-a", object(), "1")
     plugin_state = {"plugin-a": (object(), "1")}
     adapter._loaded_agent_template = template_state
@@ -260,6 +282,12 @@ async def test_code_reload_rolls_back_spec_rails_when_apply_fails(
         adapter._last_models_config_fingerprint = "new-fingerprint"
         adapter._model_cache = {"new-model": new_model}
         adapter._model_name_to_keys = {"new-model": ["new-model"]}
+        adapter._model_recipes = {"new-model": {"model_id": "new-id"}}
+        adapter._model_alias_to_key = {"new-alias": "new-model"}
+        adapter._global_index_to_cache_key = {2: "new-model"}
+        adapter._model_id_to_key = {"new-id": "new-model"}
+        adapter._model_group_cache = {"new-group": new_model}
+        adapter._kernel_identity = "new-kernel"
         return new_model
 
     monkeypatch.setattr(adapter, "_create_model", create_model)
@@ -293,6 +321,12 @@ async def test_code_reload_rolls_back_spec_rails_when_apply_fails(
     assert adapter._last_models_config_fingerprint == "old-fingerprint"
     assert adapter._model_cache == {"old-model": old_model}
     assert adapter._model_name_to_keys == {"old-model": ["old-model"]}
+    assert adapter._model_recipes == {"old-model": {"model_id": "old-id"}}
+    assert adapter._model_alias_to_key == {"old-alias": "old-model"}
+    assert adapter._global_index_to_cache_key == {1: "old-model"}
+    assert adapter._model_id_to_key == {"old-id": "old-model"}
+    assert adapter._model_group_cache == {"old-group": old_model}
+    assert adapter._kernel_identity == "old-kernel"
 
 
 @pytest.mark.asyncio
@@ -367,6 +401,7 @@ async def test_config_reload_does_not_replace_caller_supplied_spec(
         config_base,
         {"API_KEY": "updated"},
         None,
+        permission_notification=False,
     )
     build_snapshot.assert_not_called()
     assert adapter._instance is instance

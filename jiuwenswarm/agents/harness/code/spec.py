@@ -83,6 +83,19 @@ def _build_code_rail_bundle(
 ) -> list[Any]:
     """Resolve all configured code rails through the adapter's canonical builders."""
     ctx = _require_code_context(context)
+    from jiuwenswarm.common.permission_mode import is_auto_permission_enabled
+
+    if (
+        is_auto_permission_enabled(ctx.config_base.get("permissions", {}))
+        and ctx.adapter._auto_permission_capability_enabled()  # pylint: disable=protected-access
+    ):
+        from openjiuwen.harness.schema.build_context import parent_sys_operation
+
+        model = ctx.extras.get("_parent_model")
+        operation = parent_sys_operation(ctx)
+        if model is None or operation is not ctx.adapter._sys_operation:  # pylint: disable=protected-access
+            raise RuntimeError("code_permission_spec_handles_mismatch")
+        ctx.adapter._adopt_code_spec_model(model)  # pylint: disable=protected-access
     config_snapshot = deepcopy(ctx.config_base)
     modes = config_snapshot.setdefault("modes", {})
     if not isinstance(modes, dict):
@@ -136,6 +149,14 @@ def _build_code_tool_bundle(
     # after materialization updates the AbilityManager owner.
     for tool in tools:
         register_tool(tool, agent_id)
+
+    # tool_search: progressive disclosure of explicitly-deferred tools.
+    # Gate-driven (not list-driven) and delegated to the adapter — mirror of
+    # the deep adapter's ``_get_tool_cards`` tail; extends ``tools`` in place
+    # so the card rides the standard spec like every configured tool above.
+    adapter._materialize_tool_retrieval_spec_tools(  # pylint: disable=protected-access
+        agent_id, tools, ctx.config_base
+    )
     return [tool.card for tool in tools if getattr(tool, "card", None) is not None]
 
 

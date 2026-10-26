@@ -76,13 +76,15 @@ def apply_trace_header(
         if str(key).lower() != "x-trace-id"
     } | {TRACE_ID_HEADER: resolved}
 
+from jiuwenswarm.common.client.agent_client import AgentServerClient
+from gateway.routing.container_files import AgentFileDownloadChunk
+
 from jiuwenswarm.common.e2a.agent_compat import e2a_to_agent_request
 from jiuwenswarm.common.e2a.models import E2AEnvelope
 from jiuwenswarm.common.e2a.wire_codec import (
     parse_agent_server_wire_chunk,
     parse_agent_server_wire_unary,
 )
-from jiuwenswarm.gateway.routing.agent_client import AgentServerClient
 from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk, AgentRequest
 
 
@@ -373,19 +375,6 @@ class YuanrongAgentApiError(RuntimeError):
 
 class YuanrongAgentTimeoutError(YuanrongAgentApiError):
     """请求已发出但等待响应超时（请求可能已在服务端生效，调用方需按幂等处理）。"""
-
-
-@dataclass(frozen=True)
-class AgentFileDownloadChunk:
-    """One chunk from GET /api/agent/:instanceId/files/download."""
-
-    data: bytes
-    path: str
-    offset: int
-    chunk_size: int
-    size: int
-    content_type: str
-    eof: bool
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { HelpCircle, CircleCheck, Clock3, CircleAlert, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import tipIcon from '../../assets/tip.svg';
 import { FormDrawer, Input, Textarea } from '../ui';
 import {
   beginHubOAuth,
@@ -12,7 +11,7 @@ import {
 } from '../../utils/gitcodeOAuth';
 import { PUBLISH_RESTORE_KEY, useAssetPublish } from '../../hooks/useAssetPublish';
 import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
-import { publishOutcome, validateMetadata, publishTimestamp } from '../../features/assetPublishState';
+import { canStartNewVersion, localRecordState, validateMetadata, publishTimestamp } from '../../features/assetPublishState';
 import { publishIssueKey } from '../../features/assetPublishErrors';
 import type { AssetPublishOpenRequest, AssetReference, PublishMetadata } from '../../types/assetPublish';
 import gitcodeIcon from '../../assets/settings/channels/gitcode.png';
@@ -93,18 +92,24 @@ const messages = {
     refresh: '刷新本地已知结果',
     queued: '已排队',
     uploading: '上传中',
-    pending_moderation: '提交成功，待审核',
-    published: '已发布',
     failed: '发布失败',
-    unknown: '结果待核实',
-    observed: '这里显示后端已知结果，不自动查询远端审核进度。',
+    submitted: '已提交',
+    unconfirmed: '提交结果未确认',
+    observed: '这里只显示本地可确定的提交状态；远端发布状态请以 Hub 为准。',
     requestFailed: '请求未完成，请重试或重新登录。',
+    undefinedPlaceholder: '连接器配置包含未声明的参数。请检查凭证占位符：宿主 OAuth 仅自动提供 OAUTH_ACCESS_TOKEN，其他参数需声明凭证字段。此问题与 Hub 登录无关。',
+    invalidAgentMcp: 'Hub 拒绝了连接器包校验（invalid_agent_mcp）。请检查清单及凭证声明；OAuth 认证头应由宿主提供，而非作为手填 Token 字段发布。请更新宿主后重新检查发布内容，不要反复重新登录。',
+    invalidPackage: '发布内容不合法，请检查清单文件或版本号后重试。',
+    publishUnavailable: '发布服务暂时不可用，请稍后重试。',
+    uploadOutcomeUnknown: '提交结果未确认。请到 Hub 的“我的上传”确认该版本是否存在，再决定是否重新提交。',
     invalidPluginStructure: '资源包结构不符合 Hub 要求，请检查清单文件和目录结构。',
     pluginNotFound: 'Hub 中找不到要更新的资源，请检查“更新目标 Hub ID”后重试。',
     sessionExchangeFailed: 'Hub 登录结果兑换失败，请重新授权；若仍失败请联系 Hub 管理员。',
     authRequired: '登录状态已失效，请重新登录。',
     resourceNotFound: '找不到本地资源，请确认资源仍然存在。',
     versionConflict: '该版本已提交过，请修改版本；确认需要覆盖时可在高级设置中开启覆盖。',
+    hubRequestFailed:
+      'Hub 未接受本次发布请求，可能是版本已存在或发布信息不符合 Hub 要求。请检查版本和发布信息后重试；如仍失败，请联系 Hub 管理员。',
     statusFailed: '任务查询暂时失败；后台任务仍可能运行，可刷新恢复。',
     commitUncertain: '提交响应未收到。请找回此次提交或刷新记录，不要创建新提交。',
     commitRejected: '后台拒绝了此次提交。请返回修改并重新检查。',
@@ -118,7 +123,6 @@ const messages = {
     unavailable: '此资源暂时无法发布，请查看检查原因。',
     empty: '无',
     draftExpiry: '检查结果有效期',
-    review: '请核对可见范围与内容，确认后由后台上传。',
     localSource: '本地资源',
     basicInfo: '基本信息',
     publishSettings: '发布设置',
@@ -180,12 +184,17 @@ const messages = {
     refresh: 'Refresh known local result',
     queued: 'Queued',
     uploading: 'Uploading',
-    pending_moderation: 'Submitted, pending moderation',
-    published: 'Published',
     failed: 'Publishing failed',
-    unknown: 'Result needs verification',
-    observed: 'This is the result known to the backend; remote moderation is not polled.',
+    submitted: 'Submitted',
+    unconfirmed: 'Submission result unconfirmed',
+    observed: 'Only locally confirmed submission states are shown here; check the Hub for remote publication status.',
     requestFailed: 'The request did not complete. Retry or sign in again.',
+    undefinedPlaceholder: 'The connector configuration contains an undeclared parameter. Host OAuth supplies only OAUTH_ACCESS_TOKEN; other parameters need credential schema fields. This is not a Hub sign-in error.',
+    invalidAgentMcp: 'Hub rejected connector package validation (invalid_agent_mcp). Check the manifest and credentials declaration. The host must supply OAuth authorization headers, not publish them as manual token fields. Update the host and check the package again instead of repeatedly signing in.',
+    invalidPackage: 'The package is not publishable. Check its manifest or version and retry.',
+    publishUnavailable: 'The publishing service is unavailable right now. Retry later.',
+    uploadOutcomeUnknown:
+      'The submission result is unconfirmed. Check "My uploads" on the Hub before submitting again.',
     invalidPluginStructure: 'The package structure does not meet Hub requirements. Check its manifest and folders.',
     pluginNotFound: 'The Hub resource to update was not found. Check the target Hub ID and retry.',
     sessionExchangeFailed:
@@ -194,6 +203,8 @@ const messages = {
     resourceNotFound: 'The local resource was not found. Confirm that it still exists.',
     versionConflict:
       'This version was already submitted. Change it, or explicitly enable overwrite in advanced settings.',
+    hubRequestFailed:
+      'Hub did not accept this publishing request. The version may already exist, or the publishing information may not meet Hub requirements. Check the version and publishing information, then retry. If the problem continues, contact the Hub administrator.',
     statusFailed: 'Status is temporarily unavailable. The background task may still be running; refresh to recover.',
     commitUncertain:
       'No submission response was received. Recover this submission or refresh records before starting another.',
@@ -208,7 +219,6 @@ const messages = {
     unavailable: 'This resource cannot be published yet. Review the reasons below.',
     empty: 'None',
     draftExpiry: 'Review expires',
-    review: 'Check visibility and package contents. Confirming starts the backend upload.',
     localSource: 'Local resource',
     basicInfo: 'Basic information',
     publishSettings: 'Publishing settings',
@@ -287,6 +297,11 @@ function AssetPublishDrawer({
     };
     if (code && known[code]) return known[code][zh ? 0 : 1] + (issue?.path ? ` (${issue.path})` : '');
     const safeKey = publishIssueKey(code || value);
+    // Connector validation errors can contain credential details in the Hub message.
+    if (safeKey === 'undefinedPlaceholder' || safeKey === 'invalidAgentMcp') return text(safeKey);
+    // Prefer the Hub's own guidance when it is short enough; it is more specific than any code table.
+    const reported = typeof issue?.message === 'string' ? issue.message.trim() : '';
+    if (reported) return reported;
     return safeKey === 'requestFailed' ? text('requestFailed') : text(safeKey);
   };
   const panel = useRef<HTMLElement | null>(null);
@@ -378,11 +393,11 @@ function AssetPublishDrawer({
     description: 'descriptionHelp',
     tags: 'tagsHelp',
   };
-  const outcome = state.record ? publishOutcome(state.record) : null;
+  const recordState = state.record ? localRecordState(state.record) : null;
   const ResultIcon =
-    outcome === 'failed'
+    recordState === 'failed'
       ? CircleAlert
-      : ['queued', 'uploading', 'unknown'].includes(outcome || '')
+      : ['queued', 'uploading', 'unconfirmed'].includes(recordState || '')
         ? Clock3
         : CircleCheck;
   const zh = i18n.language.startsWith('zh');
@@ -457,12 +472,6 @@ function AssetPublishDrawer({
       className="asset-publish-drawer"
       panelRef={panel}
       closeTestId="asset-publish-close"
-      notice={
-        <div className="asset-publish-notice" data-testid="asset-publish-notice">
-          <img src={tipIcon} alt="" aria-hidden="true" className="w-4 h-4" />
-          <span>{text('review')}</span>
-        </div>
-      }
       footer={
         <>
           {!review && !state.record && invalid && (
@@ -640,7 +649,7 @@ function AssetPublishDrawer({
         >
           <fieldset
             className="asset-publish-form-fields"
-            disabled={state.busy || (state.loggedIn && !state.description)}
+            disabled={state.busy || !state.description}
           >
             <section
               className="asset-publish-form-section"
@@ -744,7 +753,6 @@ function AssetPublishDrawer({
           <p data-testid="asset-publish-review-visibility">
             {text('visibility')}: {text(state.metadata.visibility)}
           </p>
-          <p>{text('review')}</p>
           {state.draft && (
             <>
               <p data-testid="asset-publish-package-summary">
@@ -778,18 +786,18 @@ function AssetPublishDrawer({
           )}
         </section>
       )}
-      {state.record && outcome && (
+      {state.record && recordState && (
         <section
           aria-live="polite"
           className="asset-publish-result-card"
           data-testid="asset-publish-result"
-          data-variant={outcome}
+          data-variant={recordState}
         >
           <header className="asset-publish-result-header" data-testid="asset-publish-result-header">
-            <span className="asset-publish-result-icon" aria-hidden="true">
+            <span className="asset-publish-result-icon" aria-hidden="true" data-testid="asset-publish-result-icon">
               <ResultIcon size={20} />
             </span>
-            <h3>{text(outcome as MessageKey)}</h3>
+            <h3 data-testid="asset-publish-result-status">{text(recordState as MessageKey)}</h3>
           </header>
           <dl className="asset-publish-result-metadata" data-testid="asset-publish-result-metadata">
             {state.record.result?.asset_id && (
@@ -814,7 +822,7 @@ function AssetPublishDrawer({
           )}
           <footer className="asset-publish-result-footer" data-testid="asset-publish-result-footer">
             <p data-testid="asset-publish-observed-note">{text('observed')}</p>
-            {!['queued', 'uploading', 'unknown'].includes(outcome) && (
+            {canStartNewVersion(state.record) && (
               <button
                 type="button"
                 data-testid="asset-publish-new-version"
@@ -868,8 +876,12 @@ function AssetPublishDrawer({
                   <strong>{record.result?.version || record.version || text('empty')}</strong>
                   {record.updated_at && <small>{dateText(record.updated_at)}</small>}
                 </span>
-                <span className="asset-publish-record-status" data-variant={publishOutcome(record)}>
-                  {text(publishOutcome(record) as MessageKey)}
+                <span
+                  className="asset-publish-record-status"
+                  data-testid="asset-publish-record-status"
+                  data-variant={localRecordState(record)}
+                >
+                  {text(localRecordState(record) as MessageKey)}
                 </span>
               </button>
             ))}

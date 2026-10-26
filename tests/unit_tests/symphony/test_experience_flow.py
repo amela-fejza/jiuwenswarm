@@ -27,12 +27,12 @@ from openjiuwen.harness.rails.evolution import (
 )
 from openjiuwen.symphony.flow import SkillPackAdapter, SkillPackNotInstallableError
 
-from jiuwenswarm.runtime.host_services import (
+from jiuwenswarm.common.host_services import (
     install_runtime_push_handler,
     restore_runtime_push_handler,
 )
 from jiuwenswarm.common.schema.message import ReqMethod
-from jiuwenswarm.gateway.channel_manager.web.app_web_handlers import (
+from gateway.channel_manager.web.app_web_handlers import (
     _FORWARD_NO_LOCAL_HANDLER_METHODS,
     _FORWARD_REQ_METHODS,
 )
@@ -87,7 +87,8 @@ def test_candidate_question_uses_beginner_friendly_skill_package_copy() -> None:
     assert "**技能包名称**\n研究组合" in question["question"]
     assert "**适用场景**\n适合检索后生成报告" in question["question"]
     assert "**包含的技能及执行顺序**\n`search` → `writer`" in question["question"]
-    assert "**使用记录**\n执行 2 次，成功 2 次" in question["question"]
+    assert "**使用记录**" not in question["question"]
+    assert "执行 2 次，成功 2 次" not in question["question"]
     assert "沉淀" not in question["header"]
     assert "沉淀" not in question["question"]
     assert question["options"] == [
@@ -272,7 +273,7 @@ def rail_capture(monkeypatch):
 def test_evolution_is_the_only_core_experience_switch(tmp_path: Path) -> None:
     config = symphony_config_from_dict({"paths": {"graph_dir": str(tmp_path)}})
 
-    assert config.evolution.enabled is False
+    assert config.evolution.flow.enabled is False
     assert not hasattr(config.evolution, "backend")
     assert not hasattr(config, "flow")
 
@@ -867,7 +868,7 @@ def test_published_capability_snapshot_rejects_invalid_contracts(
     assert [item.capability_id for item in identities] == ["valid"]
 
 
-def test_core_flow_ignores_legacy_distill_switch(monkeypatch, tmp_path: Path) -> None:
+def test_explicit_flow_enabled_false_skips_core_flow(monkeypatch, tmp_path: Path) -> None:
     config = symphony_config_from_dict(
         {
             "enabled": True,
@@ -904,10 +905,70 @@ def test_core_flow_ignores_legacy_distill_switch(monkeypatch, tmp_path: Path) ->
     runtime = service._runtime_for(config)
 
     assert runtime is service._runtime
+    assert "review_model" not in created
+    assert created["runtime"]["flow_engine"] is None
+
+
+def test_core_flow_uses_success_count_config_and_ignores_legacy_switch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = symphony_config_from_dict(
+        {
+            "enabled": True,
+            "paths": {"graph_dir": str(tmp_path / "graph")},
+            "evolution": {
+                "enabled": False,
+                "flow": {"enabled": True, "min_successes": 6},
+            },
+        }
+    )
+    service = SwarmSymphonyService()
+    model = object()
+    created: dict[str, object] = {}
+
+    class ReviewAgent:
+        def __init__(self, value) -> None:
+            created["review_model"] = value
+
+    class Gate:
+        def __init__(self, agent) -> None:
+            created["review_agent"] = agent
+
+    class Flow:
+        def __init__(self, root, **kwargs) -> None:
+            created["flow_root"] = root
+            created.update(kwargs)
+
+    class Runtime:
+        def __init__(self, **kwargs) -> None:
+            created["runtime"] = kwargs
+
+    _patch_runtime_construction(monkeypatch, Flow, Runtime, model)
+    monkeypatch.setattr(
+        "jiuwenswarm.symphony.service.LLMPackageReviewAgent", ReviewAgent
+    )
+    monkeypatch.setattr("jiuwenswarm.symphony.service.PackageReviewGate", Gate)
+    runtime = service._runtime_for(config)
+
+    assert runtime is service._runtime
     assert created["review_model"] is model
     assert created["review_agent"] is not None
     assert created["flow_root"] == tmp_path / "flow"
     assert created["llm_client"] is model
+    flow_config = created["config"]
+    accepted = inspect.signature(type(flow_config)).parameters
+    if "min_successes" in accepted:
+        assert flow_config.min_successes == 6
+    else:
+        assert flow_config.min_successes_candidate == 6
+        assert flow_config.min_successes_verified == 6
+    if "min_pack_success_rate" in accepted:
+        assert flow_config.min_pack_success_rate == config.evolution.flow.min_pack_success_rate
+    elif "min_pack_success_rate_verified" in accepted:
+        assert (
+            flow_config.min_pack_success_rate_verified
+            == config.evolution.flow.min_pack_success_rate
+        )
     assert isinstance(created["skill_adapter"], SkillPackAdapter)
     assert isinstance(created["runtime"]["flow_engine"], Flow)
 

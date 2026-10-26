@@ -26,6 +26,11 @@ def _updates_dir() -> Path:
     return path
 
 
+def restart_pending_path() -> Path:
+    """Marker written before the upgrading Gateway stops itself for a relaunch."""
+    return _updates_dir() / ".restart_pending.json"
+
+
 class UpgradeExecutor(ABC):
     upgrade_mode: str = ""
     is_platform_supported: bool = True
@@ -150,6 +155,12 @@ class DesktopExecutor(UpgradeExecutor):
                     {"downloaded_bytes": downloaded, "total_bytes": total_bytes}
                 )
 
+            if total_bytes and downloaded != total_bytes:
+                raise RuntimeError(
+                    f"Incomplete download: expected {total_bytes} bytes, "
+                    f"received {downloaded}"
+                )
+
 
 class PipExecutor(UpgradeExecutor):
     upgrade_mode = "pip"
@@ -237,7 +248,7 @@ class PipExecutor(UpgradeExecutor):
             if uv_cmd:
                 result = subprocess.run(
                     [uv_cmd, "pip", "show", "--format", "json", package],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
                 )
                 if result.returncode == 0:
                     import json as _json
@@ -250,7 +261,7 @@ class PipExecutor(UpgradeExecutor):
             else:
                 result = subprocess.run(
                     [sys.executable, "-m", "pip", "show", package],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
                 )
                 if result.returncode == 0:
                     for line in result.stdout.splitlines():
@@ -385,7 +396,7 @@ class PipExecutor(UpgradeExecutor):
             "frontend_port": frontend_port,
             "timestamp": time.time(),
         }
-        restart_file = _updates_dir() / ".restart_pending.json"
+        restart_file = restart_pending_path()
         with open(restart_file, "w", encoding="utf-8") as f:
             f.write(json.dumps(restart_data, indent=2))
             f.flush()

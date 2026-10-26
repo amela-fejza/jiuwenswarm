@@ -6,12 +6,12 @@ from typing import Any
 
 import pytest
 
-from jiuwenswarm.gateway.channel_manager.base import RobotMessageRouter
-from jiuwenswarm.gateway.channel_manager.web.app_web_handlers import (
+from gateway.channel_manager.base import RobotMessageRouter
+from gateway.channel_manager.web.app_web_handlers import (
     WebHandlersBindParams,
     _register_web_handlers,
 )
-from jiuwenswarm.gateway.channel_manager.web.web_connect import (
+from gateway.channel_manager.web.web_connect import (
     WebChannel,
     WebChannelConfig,
     _MethodHandlerInvocation,
@@ -157,6 +157,22 @@ def test_resolve_connection_user_id_header_only():
 
 def test_resolve_connection_user_id_empty():
     ws = type("Ws", (), {})()
+    uid = WebChannel._resolve_connection_user_id({}, ws)
+    assert uid is None
+
+
+def test_resolve_connection_user_id_client_declared_overrides_authenticated():
+    # 与 agent_os 稳定版契约一致：客户端声明（query user_id / X-User-Id，值为
+    # username）优先；authenticated_user_id（IAM UUID）只作认证门禁，
+    # 不参与连接身份推导（否则 /home/agentos/users/<uuid> 工作区不存在）。
+    ws = type("Ws", (), {"authenticated_user_id": "d8e63255-9dfd-4aa0-8b59-2b9096442154"})()
+    uid = WebChannel._resolve_connection_user_id({"user_id": "zhw"}, ws)
+    assert uid == "zhw"
+    assert WebChannel._connection_user_id(ws) == "zhw"
+
+
+def test_resolve_connection_user_id_ignores_authenticated_without_declaration():
+    ws = type("Ws", (), {"authenticated_user_id": "d8e63255-9dfd-4aa0-8b59-2b9096442154"})()
     uid = WebChannel._resolve_connection_user_id({}, ws)
     assert uid is None
 
@@ -322,7 +338,7 @@ async def test_openai_account_unexpected_error_uses_method_dispatcher(monkeypatc
         })
 
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.channel_manager.web.app_web_handlers._openai_account_auth_status_payload",
+        "gateway.channel_manager.web.app_web_handlers._openai_account_auth_status_payload",
         raise_unexpected_error,
     )
     monkeypatch.setattr(channel, "send_response", capture_response)

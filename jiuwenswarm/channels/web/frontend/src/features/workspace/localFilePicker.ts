@@ -16,6 +16,7 @@ export const DESKTOP_LOCAL_FILES_EVENT = 'jiuwen-desktop-local-files';
 export const DESKTOP_READY_EVENT = 'jiuwen-desktop-ready';
 export const DESKTOP_FILE_DRAG_EVENT = 'jiuwen-desktop-file-drag';
 export const DESKTOP_DIRECTORY_DROP_REJECTED_EVENT = 'jiuwen-desktop-directory-drop-rejected';
+export const DESKTOP_VIRTUAL_FILE_DROP_REJECTED_EVENT = 'jiuwen-desktop-virtual-file-drop-rejected';
 
 export type DesktopLocalFilesEventDetail = {
   source?: 'drop' | 'paste' | string;
@@ -127,6 +128,23 @@ function dataTransferHasDirectory(dt: DataTransfer | null): boolean {
   }
 }
 
+function dataTransferHasVirtualFiles(dt: DataTransfer | null): boolean {
+  if (!dt?.items) return false;
+  try {
+    const fileItems = Array.from(dt.items).filter(item => item.kind === 'file');
+    if (!fileItems.length) return false;
+    return fileItems.some((item) => {
+      const getEntry = (item as DataTransferItem & {
+        webkitGetAsEntry?: () => { isFile?: boolean; isDirectory?: boolean } | null;
+      }).webkitGetAsEntry;
+      if (typeof getEntry !== 'function') return false;
+      return getEntry.call(item) === null;
+    });
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Install window-level file-drag accept handlers inside the desktop webview.
  * Must run in the page itself (not only via Python evaluate_js) so a frontend
@@ -197,9 +215,38 @@ export function installDesktopFileDragAccept(): boolean {
     (event: DragEvent) => {
       if (!dataTransferHasFiles(event.dataTransfer)) return;
       event.preventDefault();
+      if (dataTransferHasVirtualFiles(event.dataTransfer)) {
+        event.stopImmediatePropagation();
+        window.dispatchEvent(new CustomEvent(DESKTOP_VIRTUAL_FILE_DROP_REJECTED_EVENT));
+        endDrag();
+        return;
+      }
       if (dataTransferHasDirectory(event.dataTransfer)) {
         event.stopImmediatePropagation();
         window.dispatchEvent(new CustomEvent(DESKTOP_DIRECTORY_DROP_REJECTED_EVENT));
+        endDrag();
+        return;
+      }
+      const describeDroppedFiles = window.jiuwenDesktop?.describeDroppedFiles;
+      if (describeDroppedFiles) {
+        const files = Array.from(event.dataTransfer?.files || []);
+        const consumer = desktopLocalFilesConsumer;
+        const detail: DesktopLocalFilesEventDetail = {
+          source: 'drop', clientX: event.clientX, clientY: event.clientY,
+          dropId: crypto.randomUUID(),
+        };
+        // Resolve paths only for Electron. The pywebview bridge delivers its own event.
+        void Promise.resolve().then(() => describeDroppedFiles(files)).then((picks) => {
+          // Do not deliver a slow file read to a different conversation or modal.
+          if (consumer !== desktopLocalFilesConsumer) return;
+          if (!picks.length) {
+            window.dispatchEvent(new CustomEvent(DESKTOP_VIRTUAL_FILE_DROP_REJECTED_EVENT));
+            return;
+          }
+          window.__JIUWEN_INGEST_LOCAL_FILES__?.({ ...detail, files: picks });
+        }).catch((error) => {
+          console.error('Failed to read dropped desktop files:', error);
+        });
       }
       endDrag();
     },

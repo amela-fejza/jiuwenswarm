@@ -118,7 +118,17 @@ def _defaults(kind: str, local_id: str, source) -> dict:
             value = value.get("zh") or value.get("en") or ""
         return value if isinstance(value, str) else ""
 
-    name = label(data.get("id" if kind in {"plugin", "mcp"} else "name")) or local_id
+    manifest_name = label(data.get("name"))
+    if kind in {"agent_template", "agent_group"} and isinstance(source, Path):
+        # Agent manifests use ``name`` as a user-facing label, while the
+        # resolved package directory is the canonical Hub package identity.
+        # This also avoids publishing a Hub asset UUID when ``local_id`` is
+        # the remote identity rather than the installed package name.
+        name = source.name
+        display_name = label(data.get("display_name")) or manifest_name or name
+    else:
+        name = label(data.get("id" if kind in {"plugin", "mcp"} else "name")) or local_id
+        display_name = label(data.get("display_name")) or name
     version = label(data.get("version")) or "1.0.0"
     if not re.fullmatch(r"(?:\d+\.\d+\.\d+|[0-9a-f]{7})", version):
         version = "1.0.0"
@@ -130,7 +140,7 @@ def _defaults(kind: str, local_id: str, source) -> dict:
     return dict(
         asset_name=name,
         version=version,
-        display_name=label(data.get("display_name")) or name,
+        display_name=display_name,
         description=label(data.get("description"))
         or label(data.get("display_description")),
         tags=[t for t in tags if isinstance(t, str)] if isinstance(tags, list) else [],
@@ -244,8 +254,14 @@ class AssetPublishAPI:
             # resolver. This read-only summary never grants Hub account access.
             self._resolver(kind, local_id)
             return {"state": self.store.local_status(kind, local_id)}
-        auth = self._auth(params.get("auth"))
-        scope = self.scope(str(gateway_user or ""), params["auth"])
+        # Local defaults use workspace access; account records still require Hub auth.
+        auth_data = params.get("auth")
+        local_describe = method == "describe" and (
+            auth_data is None
+            or (isinstance(auth_data, dict) and auth_data.get("access_token") in (None, ""))
+        )
+        auth = None if local_describe else self._auth(auth_data)
+        scope = None if local_describe else self.scope(str(gateway_user or ""), auth_data)
         try:
             if method in {"describe", "prepare", "records"}:
                 kind, local_id = params.get("kind"), _safe_id(params.get("local_id"))
@@ -265,7 +281,7 @@ class AssetPublishAPI:
                         can_publish=True,
                         hub_url=self.hub_url,
                         errors=[],
-                        records=self.service.records(scope, kind, local_id),
+                        records=[] if local_describe else self.service.records(scope, kind, local_id),
                         identity_verified=False,
                     )
                 metadata = params.get("metadata")

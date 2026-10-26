@@ -14,8 +14,8 @@ import pytest
 
 from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk
 from jiuwenswarm.common.schema.message import ReqMethod
-from jiuwenswarm.gateway.cron.models import CronJob, CronRunState
-from jiuwenswarm.gateway.cron.scheduler import (
+from gateway.cron.models import CronJob, CronRunState
+from gateway.cron.scheduler import (
     CRON_INTERRUPT_RESULT_TEXT,
     CronSchedulerService,
     _Event,
@@ -24,9 +24,9 @@ from jiuwenswarm.common.cron_team_completion import (
     cron_team_round_should_end,
     new_cron_team_round_state,
 )
-from jiuwenswarm.gateway.cron import scheduler as cron_scheduler_module
-from jiuwenswarm.gateway.cron.store import CronJobStore
-from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
+from gateway.cron import scheduler as cron_scheduler_module
+from gateway.cron.store import CronJobStore
+from gateway.message_handler.message_handler import MessageHandler
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -445,6 +445,64 @@ class TestCronLastSessionId:
         assert stored.last_session_id == "cron_agentserver_allocated"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "chunks, completed, expected_text",
+        [
+            pytest.param(
+                [(None, True)], True, "[cron] 任务执行完成但未返回结果内容",
+                id="empty-terminal",
+            ),
+            pytest.param(
+                [({"event_type": "chat.final", "content": ""}, False), ({"is_complete": True}, True)],
+                True, "[cron] 任务执行完成但未返回结果内容", id="empty-final",
+            ),
+            pytest.param(
+                [], False, "[cron] 任务执行流提前结束，未收到完成信号", id="eof",
+            ),
+            pytest.param(
+                [({"event_type": "chat.delta", "content": "partial"}, False)],
+                False, "[cron] 任务执行流提前结束，未收到完成信号", id="partial-eof",
+            ),
+            pytest.param(
+                [({"event_type": "chat.error", "error": "boom"}, True)],
+                False, "boom", id="chat-error",
+            ),
+            pytest.param(
+                [({"error": "boom"}, True)], False, "boom", id="legacy-error",
+            ),
+            pytest.param(
+                [({"event_type": "runtime.error", "error": "boom"}, True)],
+                False, "boom", id="runtime-error",
+            ),
+        ],
+    )
+    async def test_stream_completion_controls_last_session_id(self, tmp_path, chunks, completed, expected_text):
+        """#4980: text-less completion records the session; failure keeps the previous one."""
+        class StreamAgentClient(FakeAgentClient):
+            async def send_request_stream(self, envelope):
+                for payload, is_complete in chunks:
+                    yield AgentResponseChunk(
+                        request_id=envelope.request_id or "",
+                        channel_id=envelope.channel or "",
+                        payload=payload,
+                        is_complete=is_complete,
+                    )
+
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        await store.update_job(job.id, {"last_session_id": "previous-success"})
+        svc = _make_scheduler(store, agent_client=StreamAgentClient())
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        stored = await store.get_job(job.id)
+        assert stored is not None
+        assert stored.last_session_id == ("cron_agentserver_allocated" if completed else "previous-success")
+        assert svc.runs[run_id].status == "failed"
+        assert svc.runs[run_id].result_text == expected_text
+
+    @pytest.mark.asyncio
     async def test_run_now_info_returns_agentserver_execution_session_id(self, tmp_path):
         store = CronJobStore(path=tmp_path / "cron_jobs.json")
         job = await _create_one_job(store, user_id="run-now-owner")
@@ -485,7 +543,12 @@ class TestCronLastSessionId:
         assert not agent.unary_requests
 
     @pytest.mark.asyncio
-    async def test_run_now_info_keeps_team_mode(self, tmp_path):
+    async def test_run_now_info_allocates_execution_session_for_team_mode(self, tmp_path):
+        """team 任务与单 agent 统一显式预建执行会话（session.create 带 cron_id）。
+
+        旧版 team 链路由流式 chat.send 隐式建会话，cron_id 依赖聊天准入的
+        元数据同步落盘，链路被跳过时执行会话进不了"触发的会话"列表。
+        """
         store = CronJobStore(path=tmp_path / "cron_jobs.json")
         job = await _create_one_job(store, mode="team.work.normal")
         agent = FakeAgentClient()
@@ -495,8 +558,97 @@ class TestCronLastSessionId:
 
         state = svc.runs[info["run_id"]]
         assert state.exec_mode == "team.work.normal"
-        assert state.execution_session_allocated is False
-        assert not agent.unary_requests
+        assert state.execution_session_allocated is True
+        assert info["session_id"] == "cron_agentserver_allocated"
+        assert state.exec_session_id == "cron_agentserver_allocated"
+        # team 的流式事件按 targets 渠道回传，执行渠道路由保持 targets。
+        assert state.exec_channel_id == job.targets
+        create_env = next(
+            env for env in agent.unary_requests if env.method == "session.create"
+        )
+        assert create_env.params["cron_id"] == job.id
+        assert create_env.params["mode"] == "team.work.normal"
+
+
+class TestCronFailureDelivery:
+    @pytest.mark.parametrize(
+        ("raised_exception", "expected_error"),
+        [(OSError(), "OSError"), (RuntimeError("cancelled"), "cancelled")],
+    )
+    @pytest.mark.asyncio
+    async def test_exception_produces_visible_failure_and_push_update(
+        self, tmp_path, raised_exception, expected_error
+    ):
+        class ExceptionAgentClient(FakeAgentClient):
+            async def send_request_stream(self, envelope):
+                self.stream_requests.append(envelope)
+                yield AgentResponseChunk(
+                    request_id=envelope.request_id or "",
+                    channel_id=envelope.channel or "",
+                    payload={"event_type": "chat.reasoning", "content": ""},
+                    is_complete=False,
+                )
+                raise raised_exception
+
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store, targets="web")
+        handler = FakeMessageHandler()
+        svc = _make_scheduler(
+            store,
+            handler=handler,
+            agent_client=ExceptionAgentClient(),
+        )
+        run_id = f"{job.id}:1234"
+
+        with patch.object(cron_scheduler_module.logger, "warning") as warning_mock:
+            await svc.on_wake(job, run_id)
+            await svc.run_tasks[run_id]
+
+        state = svc.runs[run_id]
+        assert state.status == "failed"
+        assert state.error == expected_error
+        assert state.result_text == f"[cron] 任务执行失败: {expected_error}"
+        push_event = next(ev for _, _, ev in svc.events if ev.kind == "push_update")
+        await svc.handle_event(push_event)
+        assert len(handler.published) == 1
+        assert _cron_published_content(handler.published[0]) == state.result_text
+        failure_log = next(
+            call
+            for call in warning_mock.call_args_list
+            if "agent run failed" in call.args[0]
+        )
+        assert failure_log.args[3] == type(raised_exception).__name__
+        assert failure_log.kwargs["exc_info"] is True
+
+    @pytest.mark.asyncio
+    async def test_failed_empty_result_uses_generic_failure_and_push_update(
+        self, tmp_path
+    ):
+        class EmptyFailedResultScheduler(_TestableScheduler):
+            async def _run_stream_cron_job(self, **_kwargs):
+                return "", False, False
+
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store, targets="web")
+        handler = FakeMessageHandler()
+        svc = EmptyFailedResultScheduler(
+            store=store,
+            agent_client=FakeAgentClient(),
+            message_handler=handler,
+        )
+        run_id = f"{job.id}:1234"
+
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        state = svc.runs[run_id]
+        assert state.status == "failed"
+        assert state.error == "未知错误"
+        assert state.result_text == "[cron] 任务执行失败: 未知错误"
+        push_event = next(ev for _, _, ev in svc.events if ev.kind == "push_update")
+        await svc.handle_event(push_event)
+        assert len(handler.published) == 1
+        assert _cron_published_content(handler.published[0]) == state.result_text
 
 
 class TestCheckStoreChanged:
@@ -1097,49 +1249,6 @@ class TestGhostTaskCancelledNoPushUpdate:
         # push_update count should not increase (ghost task finally skipped)
         assert len(push_update_after) <= len(push_update_before)
 
-    @pytest.mark.asyncio
-    async def test_cancelled_task_finally_skips_result_text_and_push(self, tmp_path):
-        """state.error == "cancelled" should prevent result_text and push_update."""
-        store_file = tmp_path / "cron_jobs.json"
-        store = CronJobStore(path=store_file)
-        job = await _create_one_job(store)
-
-        handler = FakeMessageHandler()
-        svc = _make_scheduler(store, handler)
-        await svc.reload()
-
-        run_id = f"{job.id}:1234"
-        state = CronRunState(
-            run_id=run_id,
-            job_id=job.id,
-            wake_at_iso="2026-06-09T08:55:00+08:00",
-            push_at_iso="2026-06-09T09:00:00+08:00",
-            job_name=job.name,
-            targets=job.targets,
-            session_id=None,
-            chat_type=None,
-            timezone=job.timezone,
-            status="running",
-            placeholder_sent=True,
-        )
-
-        # Simulate CancelledError in _run_agent: state.error = "cancelled"
-        state.error = "cancelled"
-
-        # The finally block logic uses `is_cancelled_ghost = state.error == "cancelled"`
-        # to skip push_update. Verify the flag works correctly:
-        # Even with placeholder_sent=True, cancelled ghost should not push.
-        is_cancelled_ghost = state.error == "cancelled"
-        assert is_cancelled_ghost is True
-
-        # result_text should NOT be set for cancelled ghost (finally block check)
-        # (In real code: `if not state.result_text and state.error and not is_cancelled_ghost`)
-        if not state.result_text and state.error and not is_cancelled_ghost:
-            state.result_text = f"[cron] 任务执行失败: {state.error}"
-
-        assert state.result_text is None  # No result_text for ghost
-
-
 # ── Ghost task CHAT_CANCEL notification ────────────────────────────────────────────
 
 
@@ -1414,7 +1523,12 @@ class TestTeamModeWake:
     """Team-mode cron jobs stream to AgentServer and publish SwarmFlow chunks."""
 
     @pytest.mark.asyncio
-    async def test_team_wake_uses_isolated_session_and_stream(self, tmp_path):
+    async def test_team_wake_allocates_session_and_streams_into_it(self, tmp_path):
+        """team wake 与单 agent 一致：先 session.create（带 cron_id）再流式执行。
+
+        执行会话不再由流式 chat.send 隐式创建，会话与任务的 cron_id 关联
+        变为显式必达；流式信封渠道仍走 targets（SwarmFlow 直播路由不变）。
+        """
         store = CronJobStore(path=tmp_path / "cron_jobs.json")
         job = _make_job(
             mode="team",
@@ -1434,17 +1548,25 @@ class TestTeamModeWake:
         assert task is not None
         await task
 
+        assert len(agent.unary_requests) == 1
+        create_env = agent.unary_requests[0]
+        assert create_env.method == "session.create"
+        assert create_env.params["cron_id"] == job.id
+        assert create_env.params["mode"] == "team.work.normal"
+
         assert len(agent.stream_requests) == 1
-        assert len(agent.unary_requests) == 0
         env = agent.stream_requests[0]
         assert env.is_stream is True
         assert env.channel == "tui"
-        assert env.session_id.startswith("cron_") and env.session_id.endswith(f"_{job.id}")
+        assert env.session_id == "cron_agentserver_allocated"
         assert env.params["mode"] == "team.work.normal"
+        assert env.params["cron_id"] == job.id
         assert env.user_id == "team-owner"
 
         state = svc.runs[run_id]
         assert state.exec_user_id == "team-owner"
+        assert state.exec_session_id == "cron_agentserver_allocated"
+        assert state.execution_session_allocated is True
         assert state.status == "succeeded"
         assert state.result_text == "team result"
         assert len(handler.published) == 2
@@ -2195,7 +2317,7 @@ class TestUnaryCronJobTimeoutOverride:
 
     @pytest.mark.asyncio
     async def test_timeout_passed_through_and_cancel_invoked(self, tmp_path):
-        from jiuwenswarm.gateway.routing.agent_client import AgentServerUnaryTimeout
+        from gateway.routing.agent_client import AgentServerUnaryTimeout
 
         store = CronJobStore(path=tmp_path / "cron_jobs.json")
         job = await _create_one_job(store, targets="web")
@@ -2357,12 +2479,13 @@ class TestSingleAgentCronStream:
             chat_type=None, timezone=job.timezone,
         )
 
-        text, ok = await svc.run_stream_cron_job(
+        text, ok, completed = await svc.run_stream_cron_job(
             envelope=envelope, timeout_seconds=30.0, state=state
         )
 
         assert ok is True
         assert text == "请记得开会。"
+        assert completed is True
 
     @pytest.mark.parametrize(
         "event_type",
@@ -2424,11 +2547,12 @@ class TestSingleAgentCronStream:
         state.exec_session_id = "cron_agentserver_allocated"
         state.exec_channel_id = "__cron__"
 
-        text, ok = await svc.run_stream_cron_job(
+        text, ok, completed = await svc.run_stream_cron_job(
             envelope=envelope, timeout_seconds=0.5, state=state
         )
 
         assert ok is False
+        assert completed is False
         assert text == CRON_INTERRUPT_RESULT_TEXT
         assert len(agent_client.cancel_requests) == 1
         assert agent_client.cancel_requests[0].method == ReqMethod.CHAT_CANCEL.value
@@ -2463,11 +2587,12 @@ class TestSingleAgentCronStream:
             chat_type=None, timezone=job.timezone,
         )
 
-        text, ok = await svc.run_stream_cron_job(
+        text, ok, completed = await svc.run_stream_cron_job(
             envelope=envelope, timeout_seconds=30.0, state=state
         )
 
         assert ok is False
+        assert completed is True
         assert text == "[cron] 任务执行完成但未返回结果内容"
 
 
@@ -2614,7 +2739,7 @@ class TestExtractTextFromAgentPayload:
 
     @staticmethod
     def _call(payload):
-        from jiuwenswarm.gateway.cron.scheduler import _extract_text_from_agent_payload
+        from gateway.cron.scheduler import _extract_text_from_agent_payload
         return _extract_text_from_agent_payload(payload)
 
     def test_error_payload_returns_raw_error(self):
@@ -3026,7 +3151,7 @@ async def test_disable_project_jobs_preserves_other_jobs(tmp_path):
 @pytest.mark.asyncio
 async def test_project_gate_discards_response_crossing_hide(tmp_path, monkeypatch):
     import asyncio
-    from jiuwenswarm.gateway.routing import e2a_proxy
+    from gateway.routing import e2a_proxy
 
     svc = _make_scheduler(CronJobStore(path=tmp_path / "cron_jobs.json"))
     entered, release = asyncio.Event(), asyncio.Event()
@@ -3042,3 +3167,150 @@ async def test_project_gate_discards_response_crossing_hide(tmp_path, monkeypatc
     svc._project_admission_revisions["p"] = 2
     release.set()
     assert await pending is False
+
+
+# ── 登录免费模型：执行请求携带凭据 ────────────────────────────────────────────
+
+_LOGIN_REF = "0123456789abcdef0123456789abcdef"
+
+
+def _patch_login_credential_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fresh: dict | None = None,
+) -> None:
+    """把"按句柄取凭据"换成内存桩；是否注入仍由 job.credential_ref 真实决定。
+
+    ``fresh`` 为 refreshed_credential_for_ref 的返回值（None=凭据已撤销/拿不到）。
+    """
+    monkeypatch.setattr(
+        "gateway.auth.passthrough.refreshed_credential_for_ref",
+        lambda ref: fresh
+        if fresh is not None
+        else {"credential_ref": ref, "revoked": True},
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.common.auth.apig.resolve_apig_config",
+        lambda allow_refresh=True: SimpleNamespace(
+            invoke_base_url="https://apig.example.com/v1"
+        ),
+    )
+
+
+class TestLoginModelAuthForJob:
+    def test_returns_auth_payload_for_bound_job(self, monkeypatch):
+        """绑定了登录账号句柄的任务 → 返回请求级凭据体。"""
+        _patch_login_credential_lookup(
+            monkeypatch, fresh={"credential_ref": _LOGIN_REF, "api_key": "tok-1"}
+        )
+        job = _make_job(
+            model_name="GLM-5.2", user_id="route-user-1", credential_ref=_LOGIN_REF
+        )
+        assert cron_scheduler_module._login_model_auth_for_job(job) == {
+            "api_base": "https://apig.example.com/v1",
+            "api_key": "tok-1",
+            "credential_ref": _LOGIN_REF,
+        }
+
+    def test_none_without_binding_even_if_user_id_present(self, monkeypatch):
+        """路由 user_id 与华为账号是两套独立用户体系：没有绑定就不能注入。
+
+        回归：曾按 job.user_id 推导凭据句柄，路由 ID ≠ openid（或为空）时
+        静默拿不到凭据，任务无法使用登录模型。
+        """
+        _patch_login_credential_lookup(
+            monkeypatch, fresh={"credential_ref": _LOGIN_REF, "api_key": "tok-1"}
+        )
+        job = _make_job(model_name="GLM-5.2", user_id="route-user-1")
+        assert cron_scheduler_module._login_model_auth_for_job(job) is None
+
+    def test_none_for_malformed_ref(self, monkeypatch):
+        _patch_login_credential_lookup(
+            monkeypatch, fresh={"credential_ref": "bad", "api_key": "tok-1"}
+        )
+        job = _make_job(model_name="GLM-5.2", credential_ref="not-a-ref")
+        assert cron_scheduler_module._login_model_auth_for_job(job) is None
+
+    def test_none_when_credential_revoked(self, monkeypatch):
+        _patch_login_credential_lookup(monkeypatch, fresh=None)
+        job = _make_job(model_name="GLM-5.2", credential_ref=_LOGIN_REF)
+        assert cron_scheduler_module._login_model_auth_for_job(job) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("migrated", [False, True])
+async def test_wake_execution_carries_login_model_auth(tmp_path, monkeypatch, migrated):
+    """绑定登录账号的任务执行请求必须带 _model_auth 凭据，否则 AgentServer 会报 login_required。"""
+    store = CronJobStore(path=tmp_path / "cron_jobs.json")
+    job = await store.create_job(
+        name="free-model-job",
+        cron_expr="0 0 9 * * ? *",
+        timezone="Asia/Shanghai",
+        description="reminder",
+        targets="web",
+        user_id="route-user-1",
+        model_name="old-config-model" if migrated else "GLM-5.2",
+        model_selection={"type": "model", "id": "old-config-model-id"} if migrated else None,
+        credential_ref="" if migrated else _LOGIN_REF,
+    )
+    if migrated:
+        await store.update_job(
+            job.id, {"model_name": "GLM-5.2", "credential_ref": _LOGIN_REF}
+        )
+        job = await CronJobStore(path=store.path).get_job(job.id)
+        assert job.model_selection is None
+    agent = FakeAgentClient()
+    svc = _make_scheduler(store, agent_client=agent)
+    _patch_login_credential_lookup(
+        monkeypatch, fresh={"credential_ref": _LOGIN_REF, "api_key": "tok-1"}
+    )
+
+    run_id = f"{job.id}:1234"
+    await svc.on_wake(job, run_id)
+    await svc.run_tasks[run_id]
+
+    chat_env = next(
+        env for env in agent.stream_requests if "model_name" in (env.params or {})
+    )
+    assert chat_env.params["model_name"] == "GLM-5.2"
+    assert "model_selection" not in chat_env.params
+    assert chat_env.params["_model_auth"] == {
+        "api_base": "https://apig.example.com/v1",
+        "api_key": "tok-1",
+        "credential_ref": _LOGIN_REF,
+    }
+
+
+@pytest.mark.asyncio
+async def test_wake_execution_without_binding_omits_model_auth(tmp_path, monkeypatch):
+    """未绑定（自配模型，即使与登录模型同名）→ 不注入 _model_auth。
+
+    回归：曾按"模型名出现在登录目录"就注入，同名自配模型会被切到登录模型、
+    改用 APIG 接入点和登录账号额度计费。
+    """
+    store = CronJobStore(path=tmp_path / "cron_jobs.json")
+    job = await store.create_job(
+        name="config-model-job",
+        cron_expr="0 0 9 * * ? *",
+        timezone="Asia/Shanghai",
+        description="reminder",
+        targets="web",
+        user_id="route-user-1",
+        model_name="GLM-5.2",
+    )
+    agent = FakeAgentClient()
+    svc = _make_scheduler(store, agent_client=agent)
+    # 凭据查询桩即使返回可用凭据也不该被用到
+    _patch_login_credential_lookup(
+        monkeypatch, fresh={"credential_ref": _LOGIN_REF, "api_key": "tok-1"}
+    )
+
+    run_id = f"{job.id}:1234"
+    await svc.on_wake(job, run_id)
+    await svc.run_tasks[run_id]
+
+    chat_env = next(
+        env for env in agent.stream_requests if "model_name" in (env.params or {})
+    )
+    assert chat_env.params["model_name"] == "GLM-5.2"
+    assert "_model_auth" not in chat_env.params

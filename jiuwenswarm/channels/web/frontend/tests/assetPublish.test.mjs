@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import {
   canShowAssetPublish,
   publishOutcome,
+  localRecordState,
+  isSubmissionLocked,
+  canStartNewVersion,
   validateMetadata,
   createCommitAttempt,
 } from '../node_modules/.cache/asset-publish/assetPublishState.js';
@@ -107,12 +110,17 @@ test('catalog notice hides normal refreshes and only reports stale or failed dat
   assert.equal(catalogCacheNotice({ state: 'fresh', refreshing: true, complete: true }), null);
   assert.equal(catalogCacheNotice({ state: 'miss', refreshing: true, complete: false }), null);
   assert.equal(catalogCacheNotice({ state: 'fresh', refreshing: false, complete: false }), null);
+  assert.deepEqual(catalogCacheNotice({ state: 'stale', refreshing: true, updated_at: 1789522670.483113 }), {
+    kind: 'stale',
+    updatedAt: 1789522670.483113,
+  });
   assert.deepEqual(
-    catalogCacheNotice({ state: 'stale', refreshing: true, updated_at: 1789522670.483113 }),
-    { kind: 'stale', updatedAt: 1789522670.483113 },
-  );
-  assert.deepEqual(
-    catalogCacheNotice({ state: 'fresh', refreshing: false, fetched_at: '2026-09-16T01:37:50Z', error: 'refresh_failed' }),
+    catalogCacheNotice({
+      state: 'fresh',
+      refreshing: false,
+      fetched_at: '2026-09-16T01:37:50Z',
+      error: 'refresh_failed',
+    }),
     { kind: 'error', updatedAt: '2026-09-16T01:37:50Z' },
   );
 
@@ -125,4 +133,60 @@ test('timestamps support backend Unix seconds and ISO dates', async () => {
   const { publishTimestamp } = await import('../node_modules/.cache/asset-publish/assetPublishState.js');
   assert.equal(publishTimestamp(1700000000), 1700000000000);
   assert.equal(publishTimestamp('2023-11-14T22:13:20Z'), 1700000000000);
+});
+
+test('empty catalog waits for background refresh but settled and failed lists stop loading', async () => {
+  const { catalogAwaitingItems } = await import('../node_modules/.cache/asset-publish/catalogCache.js');
+  assert.equal(catalogAwaitingItems(0, { state: 'miss', refreshing: true }), true);
+  assert.equal(catalogAwaitingItems(0, { state: 'fresh', refreshing: false }), false);
+  assert.equal(catalogAwaitingItems(1, { state: 'stale', refreshing: true }), false);
+  assert.equal(catalogAwaitingItems(0, { state: 'error', refreshing: true }), false);
+  assert.equal(catalogAwaitingItems(0, undefined), false);
+});
+
+test('exhausted refresh stops loading and exposes an error notice', (context) => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  return import('../node_modules/.cache/asset-publish/catalogCache.js').then(
+    ({ scheduleCatalogRefresh, catalogAwaitingItems, catalogCacheNotice }) => {
+      const pending = { state: 'miss', refreshing: true };
+      let cache;
+      for (let i = 0; i < 31; i++) {
+        cache = scheduleCatalogRefresh(
+          'exhausted-test',
+          pending,
+          () => {},
+          () => true,
+        );
+        context.mock.timers.tick(4000);
+      }
+      assert.equal(catalogAwaitingItems(0, cache), false);
+      assert.equal(catalogCacheNotice(cache)?.kind, 'error');
+      assert.equal(pending.refreshing, true);
+    },
+  );
+});
+
+test('only in-flight operations lock the form; an unverified outcome can start again', () => {
+  for (const execution_status of ['queued', 'uploading']) {
+    const record = { execution_status };
+    assert.equal(isSubmissionLocked(record), true);
+    assert.equal(canStartNewVersion(record), false);
+  }
+  // #4749: 'unknown' is terminal, not an operation still owned by the backend.
+  for (const execution_status of ['completed', 'failed', 'unknown']) {
+    const record = { execution_status };
+    assert.equal(isSubmissionLocked(record), false);
+    assert.equal(canStartNewVersion(record), true);
+  }
+});
+
+test('records expose only locally confirmed states', () => {
+  assert.equal(localRecordState({ execution_status: 'queued' }), 'queued');
+  assert.equal(localRecordState({ execution_status: 'uploading' }), 'uploading');
+  assert.equal(localRecordState({ execution_status: 'failed' }), 'failed');
+  assert.equal(localRecordState({ execution_status: 'completed' }), 'submitted');
+  // 远端态（pending_moderation / published）不再上屏
+  assert.equal(localRecordState({ execution_status: 'completed', result: { publish_result: 'pending_moderation' } }), 'submitted');
+  assert.equal(localRecordState({ execution_status: 'completed', result: { publish_result: 'published' } }), 'submitted');
+  assert.equal(localRecordState({ execution_status: 'unknown' }), 'unconfirmed');
 });
