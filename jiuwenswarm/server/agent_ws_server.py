@@ -82,7 +82,7 @@ from jiuwenswarm.common.e2a.wire_codec import (
 )
 from jiuwenswarm.common.hooks_config import load_hooks_config
 from jiuwenswarm.common.log_preview import preview_text
-from jiuwenswarm.common.mode_matrix import (
+from gateway.common.mode_matrix import (
     deprecate_mode,
     is_plan_mode,
     is_single_agent_mode,
@@ -95,14 +95,14 @@ from jiuwenswarm.common.schema.agent import (
     AgentResponseChunk,
 )
 from jiuwenswarm.common.schema.message import ReqMethod
-from jiuwenswarm.common.security.ws_origin import (
+from gateway.common.security.ws_origin import (
     extract_handshake_request,
     forbidden_origin_response,
     get_header_value,
     is_allowed_browser_origin,
     is_origin_check_enabled,
 )
-from jiuwenswarm.common.session_message import (
+from gateway.common.session_message import (
     SESSION_MESSAGE_ANONYMOUS_OWNER_METADATA_KEY,
     SESSION_MESSAGE_INTERNAL_KEY,
     SESSION_MESSAGE_ORIGIN,
@@ -117,12 +117,12 @@ from jiuwenswarm.common.utils import (
     mask_sensitive,
 )
 from jiuwenswarm.common.version import get_runtime_version
-from jiuwenswarm.common.ws_diagnostics import (
+from gateway.common.ws_diagnostics import (
     describe_ws_exception,
     describe_ws_peer,
     format_ws_diagnostics,
 )
-from jiuwenswarm.common.ws_limits import AGENT_WS_MAX_MESSAGE_BYTES
+from gateway.common.ws_limits import AGENT_WS_MAX_MESSAGE_BYTES
 from jiuwenswarm.common.hook_event import AgentServerHookEvents
 from jiuwenswarm.agents.harness.common.plugins.rail_manager import get_rail_manager
 from jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist import persist_cli_trusted_directory
@@ -225,7 +225,7 @@ from jiuwenswarm.server.runtime.session.session_metadata import (
 from jiuwenswarm.server.runtime.tokenizer_service import TokenizerService
 from jiuwenswarm.server.sandbox.jiuwenbox_runner import JiuwenBoxRunner
 from jiuwenswarm.common.hooks_config import load_hooks_config
-from jiuwenswarm.common.security.ws_origin import (
+from gateway.common.security.ws_origin import (
     extract_handshake_request,
     forbidden_origin_response,
     get_header_value,
@@ -3131,7 +3131,7 @@ class AgentWebSocketServer:
                 await self._handle_agents_tools_list(ws, request, send_lock)
                 return
             if request.req_method == ReqMethod.CHAT_CANCEL:
-                if self._is_targeted_expert_request(request):
+                if self._is_targeted_expert_cancel_request(request):
                     await self._handle_cancel(ws, request, send_lock)
                     return
                 if isinstance(request.params, dict) and request.params.get("wait_for_stop"):
@@ -3448,11 +3448,17 @@ class AgentWebSocketServer:
         allow_create: bool = False,
         send_response: bool = True,
     ) -> AgentResponse:
-        """Cancel through the transport-independent Runtime operation."""
+        """Cancel through the transport-independent Runtime operation.
+
+        定向判定统一走 ``_is_targeted_expert_cancel_request``（owner 未知时也判为定向）。
+        这里若沿用严格版 ``_is_targeted_expert_request`` 重判，owner 未知的取消会在本函数里
+        翻成 False、掉进会话级取消，把 owner 团队正在跑的 turn 一起取消——与
+        ``_cancel_targeted_expert`` 的 "never the owner turn" 相悖。
+        """
         params = request.params if isinstance(request.params, dict) else {}
         if params.get("organization_stop") is True:
             resp = await self._cancel_organization(request)
-        elif self._is_targeted_expert_request(request):
+        elif self._is_targeted_expert_cancel_request(request):
             resp = await self._cancel_targeted_expert(request)
         else:
             resp = await self._execution_runtime().cancel_request(
@@ -6727,7 +6733,12 @@ class AgentWebSocketServer:
     @staticmethod
     def _organization_stream_key(request: AgentRequest) -> str:
         params = request.params if isinstance(request.params, dict) else {}
-        session_id = request.session_id or "default"
+        # session_id 的取法三处原本不一致（`request.session_id or "default"` 与
+        # `str(request.session_id or "").strip()` 与 `request.session_id or params.get(...)`）：
+        # 取消请求只把 session_id 放在 params 里时，注册侧算出的 key 是 `<sid>::organization::<team>`，
+        # 取消侧算出的却是 `default::organization::<team>`，查表落空——专家流没被取消，
+        # 响应还可能报成功。这里统一成「请求字段优先、params 兜底」。
+        session_id = request.session_id or params.get("session_id") or "default"
         team_id = str(params.get("target_team_id") or "").strip()
         return (
             f"{session_id}::organization::{team_id}"
@@ -6817,7 +6828,7 @@ class AgentWebSocketServer:
     async def _cancel_targeted_expert(self, request: AgentRequest) -> AgentResponse:
         """Cancel only a same-organization expert stream, never the owner turn."""
         params = request.params if isinstance(request.params, dict) else {}
-        session_id = str(request.session_id or "").strip()
+        session_id = str(request.session_id or params.get("session_id") or "").strip()
         team_id = str(params.get("target_team_id") or "").strip()
         owner_id = str((get_session_metadata(session_id) or {}).get("team_name") or "")
         owner = self._resolve_team_backend(session_id, owner_id)
@@ -6888,6 +6899,15 @@ class AgentWebSocketServer:
                 })
         cancelled_request_ids = {item.request_id for item in cancelled_requests}
         cancelled_request_ids.update(item["request_id"] for item in cancelled)
+        # owner 未知时给明确原因：这是「拒绝定向取消」而不是「目标不合法」，客户端据此
+        # 可以提示会话尚未就绪，而不是重试一次取消（重试仍会被拒）。
+        if owner_id:
+            failure_reason = recovery_error or "expert target is invalid or intent is unsupported"
+        else:
+            failure_reason = (
+                "session metadata has no team_name (owner unknown); "
+                "refused to fall back to a session-level cancel"
+            )
         return AgentResponse(
             request_id=request.request_id,
             channel_id=request.channel_id,
@@ -6898,10 +6918,7 @@ class AgentWebSocketServer:
                 "team_id": team_id,
                 "source": "org_expert_direct",
                 "cancelled_request_ids": sorted(cancelled_request_ids),
-                **(
-                    {"error": recovery_error or "expert target is invalid or intent is unsupported"}
-                    if not success else {}
-                ),
+                **({"error": failure_reason} if not success else {}),
             },
         )
 
@@ -6913,22 +6930,52 @@ class AgentWebSocketServer:
         return AgentWebSocketServer._is_targeted_expert_request(request)
 
     @staticmethod
-    def _is_targeted_expert_request(request: AgentRequest) -> bool:
-        """Recognize a Team target only when the durable owner is known."""
-        if request.req_method not in (ReqMethod.CHAT_SEND, ReqMethod.CHAT_CANCEL):
-            return False
+    def _team_target_and_owner(request: AgentRequest) -> tuple[str, str] | None:
+        """取 ``(target_team_id, owner_team_id)``；非 team 模式或没给 target 时返回 None。
+
+        下面两个判定的公共部分：只说「这个请求有没有形成一个合法的 team 目标」，
+        至于 owner 该不该参与比较、怎么兜底，由调用方按各自语义决定。
+        """
         params = request.params if isinstance(request.params, dict) else {}
         if not is_team_mode(params.get("mode")):
-            return False
+            return None
         team_id = str(params.get("target_team_id") or "").strip()
         if not team_id:
-            return False
-
+            return None
         session_id = str(request.session_id or params.get("session_id") or "").strip()
         owner_team_id = str(
             (get_session_metadata(session_id) or {}).get("team_name") or ""
         ).strip()
+        return team_id, owner_team_id
+
+    @staticmethod
+    def _is_targeted_expert_request(request: AgentRequest) -> bool:
+        """Recognize a Team target only when the durable owner is known."""
+        if request.req_method not in (ReqMethod.CHAT_SEND, ReqMethod.CHAT_CANCEL):
+            return False
+        pair = AgentWebSocketServer._team_target_and_owner(request)
+        if pair is None:
+            return False
+        team_id, owner_team_id = pair
         return bool(owner_team_id and team_id != owner_team_id)
+
+    @staticmethod
+    def _is_targeted_expert_cancel_request(request: AgentRequest) -> bool:
+        """CHAT_CANCEL 专用：owner 未知时也按「定向」处理，不降级为会话级取消。
+
+        与 `_is_targeted_expert_request` 的唯一差异是**兜底方向**：那边要求 owner 已知
+        且与被取消的 team 不同（用于 chat.send 路由，owner 未知就按普通会话走），这边
+        owner 未知时保守判为定向——交给 `_cancel_targeted_expert` 明确报错，而不是回落
+        `cancel_request(...)` 的会话级取消，把 owner 团队正在跑的 turn 一起取消
+        （违反同一次提交里 `_cancel_targeted_expert` 文档写明的 "never the owner turn"）。
+        """
+        if request.req_method != ReqMethod.CHAT_CANCEL:
+            return False
+        pair = AgentWebSocketServer._team_target_and_owner(request)
+        if pair is None:
+            return False
+        team_id, owner_team_id = pair
+        return not owner_team_id or team_id != owner_team_id
 
     def _expert_request_snapshot(self, session_id: str) -> list[dict[str, str]]:
         return [
@@ -9463,12 +9510,173 @@ class AgentWebSocketServer:
             payload=resp_payload,
         )
 
+    @staticmethod
+    def _command_mcp_internal_state(request: AgentRequest) -> AgentResponse:
+        """Gateway 内部状态访问：command.mcp 的受限 action 族。
+
+        为 gateway 侧远端 provider（拆仓后 ``server_store_bridge`` 的替代）
+        暴露 MCP 连接状态/注册表/凭据三个域的原子读写。与 UI 导向的
+        list/show/add/enable/update 不同，这些响应**不脱敏**（config 视图
+        构建与凭据解析需要原始数据），因此整族 action 仅对 gateway 的
+        内部通道放行，其余通道一律拒绝。
+        """
+        if str(getattr(request, "channel_id", "") or "") != "gateway":
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={
+                    "error": "internal MCP state actions are gateway-only",
+                    "code": "PERMISSION",
+                },
+            )
+        params = request.params if isinstance(request.params, dict) else {}
+        action = str(params.get("action", "") or "").strip().lower()
+        name = str(params.get("name", "") or "").strip()
+
+        def _ok(payload: dict[str, Any]) -> AgentResponse:
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=True,
+                payload=payload,
+            )
+
+        try:
+            if action == "state_config_view":
+                # config.py 视图循环的服务端整段执行：一次往返替代逐记录
+                # is_stale/record_to_entry 的 N 次调用。
+                from jiuwenswarm.server.runtime.mcp import registry as mcp_registry
+                from jiuwenswarm.server.runtime.mcp import state_store
+
+                entries = []
+                for rec in state_store.list_connected_mcps():
+                    rec_name = str(rec.get("name", "") or "")
+                    if not rec_name or mcp_registry.is_stale_marketplace_record(rec_name, rec):
+                        continue
+                    entry = state_store.record_to_mcp_entry(rec_name, rec)
+                    if entry is not None:
+                        entries.append(entry)
+                return _ok({"type": "state_config_view", "entries": entries})
+
+            from jiuwenswarm.server.runtime.mcp import state_store
+
+            if action == "state_list":
+                view = str(params.get("view", "connected") or "connected").strip()
+                view_map = {
+                    "connected": state_store.list_connected_mcps,
+                    "truly_connected": state_store.list_truly_connected_mcps,
+                    "connecting": state_store.list_connecting_mcps,
+                    "tui_enabled": state_store.list_tui_enabled_mcps,
+                    "registered": state_store.list_registered_mcps,
+                }
+                items = view_map.get(view, state_store.list_connected_mcps)()
+                return _ok({"type": "state_list", "view": view, "items": items})
+            if action == "state_get_record":
+                return _ok({"record": state_store.get_mcp_record(name)})
+            if action == "state_upsert":
+                record = state_store.upsert_mcp_record(
+                    name,
+                    params.get("entry") or {},
+                    state=str(params.get("state", "connected") or "connected"),
+                    integration_type=params.get("integration_type"),
+                    skills=params.get("skills"),
+                    enabled=params.get("enabled"),
+                )
+                return _ok({"record": record})
+            if action == "state_set_enabled":
+                state_store.set_mcp_enabled(name, enabled=bool(params.get("enabled")))
+                return _ok({})
+            if action == "state_remove":
+                return _ok({"record": state_store.remove_mcp_record(name)})
+            if action == "oauth_callback":
+                # 已移交异步方法 _command_mcp_oauth_callback（外部 HTTP 往返）
+                raise AssertionError("unreachable: oauth_callback dispatches to the async handler")
+            if action == "credential_get_all":
+                from jiuwenswarm.server.runtime.mcp.credential import CredentialStore
+
+                return _ok({"tokens": CredentialStore().get_all(name)})
+            if action == "credential_resolve":
+                from jiuwenswarm.server.runtime.mcp.credential import (
+                    CredentialStore,
+                    resolve_placeholders,
+                )
+
+                resolved = resolve_placeholders(
+                    params.get("entry") or {}, CredentialStore(), name or None
+                )
+                return _ok({"entry": resolved})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[AgentWebSocketServer] command.mcp internal state failed: %s", exc)
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc), "code": "MCP_INTERNAL"},
+            )
+        return AgentResponse(
+            request_id=request.request_id,
+            channel_id=request.channel_id,
+            ok=False,
+            payload={"error": f"unknown internal action: {action}", "code": "MCP_BAD_REQUEST"},
+        )
+
+    async def _command_mcp_oauth_callback(self, request: AgentRequest) -> AgentResponse:
+        """``oauth_callback`` 的异步形态：换码经 to_thread 执行（见分发处注释）。"""
+        if str(getattr(request, "channel_id", "") or "") != "gateway":
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={
+                    "error": "internal MCP state actions are gateway-only",
+                    "code": "PERMISSION",
+                },
+            )
+        params = request.params if isinstance(request.params, dict) else {}
+        try:
+            from jiuwenswarm.server.runtime.mcp import registry as mcp_registry
+
+            completed = await mcp_registry.complete_oauth_callback_async(
+                params.get("query") or {}
+            )
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=True,
+                payload={"completed": bool(completed)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[AgentWebSocketServer] command.mcp oauth callback failed: %s", exc)
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc), "code": "MCP_INTERNAL"},
+            )
+
     async def _handle_command_mcp(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         try:
             params = request.params or {}
             action = str(params.get("action", "list")).strip().lower()
 
-            if action == "list":
+            if action == "oauth_callback":
+                # 换码含外部 HTTP 往返（IdP 最长 20s），必须经异步孪生走
+                # to_thread，不得在事件循环上同步执行（否则冻结本进程
+                # 全部通道的流式帧与心跳）
+                resp = await self._command_mcp_oauth_callback(request)
+            elif action in {
+                "state_config_view",
+                "state_list",
+                "state_get_record",
+                "state_upsert",
+                "state_set_enabled",
+                "state_remove",
+                "credential_get_all",
+                "credential_resolve",
+            }:
+                resp = self._command_mcp_internal_state(request)
+            elif action == "list":
                 items = [self._mask_sensitive_fields(item) for item in get_mcp_servers()]
                 resp = AgentResponse(
                     request_id=request.request_id,

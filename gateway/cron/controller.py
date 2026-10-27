@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
 
-from jiuwenswarm.common.work_mode import (
+from gateway.common.work_mode import (
     DEFAULT_PROJECT_ID_CODE,
     DEFAULT_PROJECT_ID_WORK,
     EXECUTION_WORK_MODES,
@@ -306,7 +306,15 @@ class CronController:
         return cron_job_metadata()
 
     @_serialize_mutation
-    async def create_job(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def create_job(
+        self,
+        params: dict[str, Any],
+        *,
+        internal_proactive_sync: bool = False,
+    ) -> dict[str, Any]:
+        # ``internal_proactive_sync`` is a Python-level keyword set only by
+        # proactive_cron_sync. It deliberately does not live in ``params``:
+        # every key in ``params`` can be supplied by a web/tui client (#5853).
         # This marker is set only by the AgentServer-to-Gateway path after the
         # project has been resolved against the user's AgentServer directory.
         # Do not persist it with the job payload.
@@ -334,20 +342,25 @@ class CronController:
         # proactive.tick 是主动推荐开关自动维护的内部模式（proactive_cron_sync
         # 以固定 id 注册）：用户路径创建同模式任务会被后端 mode 保护拒绝启停/
         # 删除，而前端只按固定 id 识别系统任务，导致任务永远停不掉（#5128）。
-        if (
-            mode == "proactive.tick"
-            and str(params.get("id") or "").strip() != PROACTIVE_JOB_ID
-        ):
-            raise ValueError(
-                "proactive.tick 是系统内部模式，由设置→主动推荐开关自动维护，不能手动创建"
-            )
+        # 豁免不能依赖客户端可控的 params.id：用户路径携带固定 id 会整体顶替
+        # 内置任务（#5853），因此只认内部 sync 传入的关键字参数。
+        requested_id = str(params.get("id") or "").strip()
+        if not internal_proactive_sync:
+            if mode == "proactive.tick":
+                raise ValueError(
+                    "proactive.tick 是系统内部模式，由设置→主动推荐开关自动维护，不能手动创建"
+                )
+            if requested_id == PROACTIVE_JOB_ID:
+                raise ValueError(
+                    f"{PROACTIVE_JOB_ID} 是系统内置主动推荐任务的保留 id，不能手动创建"
+                )
         model_name, model_source = resolve_cron_model(
             params.get("model_name"),
             zen_entries=await self._zen_entries(),
         )
         model_selection = params.get("model_selection")
         if model_selection is not None:
-            from jiuwenswarm.common.model_selection import ModelSelection
+            from gateway.common.model_selection import ModelSelection
             from jiuwenswarm.common.model_routing_registry import ModelSelectionResolver
             selection = ModelSelection.model_validate(model_selection)
             ModelSelectionResolver().resolve(selection)
@@ -508,7 +521,7 @@ class CronController:
         # gateway 本地 project_store 反查已删除。marker 缺失的 patch 不允许
         # 携带项目字段（必须先经 AgentServer 解析）；work_mode 单独 patch
         # 沿用原规则拒绝（仅能伴随项目重解析生效）。
-        from jiuwenswarm.common.work_mode import DEFAULT_WEB_WORK_MODE
+        from gateway.common.work_mode import DEFAULT_WEB_WORK_MODE
 
         caller_work_mode = str(patch.get("work_mode") or "").strip()
         has_project_fields = "project_id" in patch or "project_dir" in patch
