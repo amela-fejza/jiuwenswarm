@@ -21,7 +21,7 @@ from jiuwenswarm.channels.process_cli.client import InProcessRuntimeClient
 from jiuwenswarm.channels.process_cli.duplex_input import DuplexLineReader
 from jiuwenswarm.channels.process_cli.live_layout import FORWARDED_RECEIPT_PREFIX
 from jiuwenswarm.channels.process_cli.prompt import LIVE_INPUT_PROMPT
-from jiuwenswarm.common.mode_matrix import (
+from gateway.common.mode_matrix import (
     canonicalize_mode_text,
     deprecate_mode,
     is_plan_mode,
@@ -39,6 +39,7 @@ _STEER_CONTEXT_KEYS = (
     "project_dir",
     "trusted_dirs",
     "supports_user_interaction",
+    "supports_permission_approval",
 )
 _TARGET_CHANGED_MARKERS = (
     "supplemental input was not sent",

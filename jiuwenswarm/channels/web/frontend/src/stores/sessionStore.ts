@@ -63,6 +63,7 @@ import { normalizeTeamGroupIdentity } from '../features/teamGroupIdentity';
 const MODE_STORAGE_KEY = 'jiuwenclaw_mode';
 const MODEL_STORAGE_KEY = 'jiuwenclaw_selected_model';
 const MODEL_SELECTION_STORAGE_KEY = 'jiuwenclaw_last_model_selection';
+const LEGACY_MODEL_STORAGE_KEY = 'jiuwenclaw_last_legacy_model';
 const AGENT_SELECTION_STORAGE_KEY = 'jiuwenclaw_agent_selection';
 const AGENT_GROUP_SELECTION_STORAGE_KEY = 'jiuwenclaw_agent_group_selection';
 const TRANSIENT_NEW_CONVERSATION_ID = 'new';
@@ -93,9 +94,25 @@ function loadLastModelSelection(): ModelSelection | null {
   }
 }
 
+function loadLastLegacyModelName(): string | null {
+  if (typeof localStorage === 'undefined') return null;
+  try { return localStorage.getItem(LEGACY_MODEL_STORAGE_KEY)?.trim() || null; } catch { return null; }
+}
+
+function cacheLastLegacyModelName(name: string): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(LEGACY_MODEL_STORAGE_KEY, name);
+    localStorage.removeItem(MODEL_SELECTION_STORAGE_KEY);
+  } catch { /* noop */ }
+}
+
 export function cacheLastModelSelection(selection: ModelSelection): void {
   if (typeof localStorage === 'undefined') return;
-  try { localStorage.setItem(MODEL_SELECTION_STORAGE_KEY, JSON.stringify(selection)); } catch { /* noop */ }
+  try {
+    localStorage.setItem(MODEL_SELECTION_STORAGE_KEY, JSON.stringify(selection));
+    localStorage.removeItem(LEGACY_MODEL_STORAGE_KEY);
+  } catch { /* noop */ }
 }
 
 /** New chats restore the last stable selection, then fall back default-group -> custom -> free -> empty. */
@@ -140,6 +157,16 @@ export function resolveAvailableModelSelection(
   return resolveNewConversationModelSelection(models, groups, selection);
 }
 
+/**
+ * True while models.list / groups have not arrived yet.
+ * An empty catalog must not be treated as “selection deleted” (#5860): refresh during
+ * goal execution often restores metadata before the catalog, and clearing then falls
+ * back to the default model.
+ */
+export function isModelCatalogPending(models: ModelEntry[], groups: ModelGroup[]): boolean {
+  return models.length === 0 && groups.length === 0;
+}
+
 export function isModelSelectionAvailable(
   selection: ModelSelection | null,
   models: ModelEntry[],
@@ -178,6 +205,15 @@ function restoreNewConversationSelection(
   // Catalog refresh can briefly omit groups; keep the draft group until the user
   // changes it. Historical sessions heal via ChatModelSelector / session restore.
   if (runtime.selectedModelSelection?.type === 'model_group') return runtime;
+  const legacyName = loadLastLegacyModelName();
+  const legacyModel = models.find((model) => model.model_name === legacyName);
+  if (legacyName && (legacyModel || models.length === 0)) {
+    return {
+      ...runtime,
+      selectedModelName: legacyName,
+      selectedModelSelection: legacyModel?.model_id ? { type: 'model', id: legacyModel.model_id } : null,
+    };
+  }
   const cached = loadLastModelSelection();
   const selection = isModelSelectionAvailable(cached, models, groups)
     ? cached
@@ -680,13 +716,6 @@ export interface SessionRuntime {
   /** 本会话 swarmflow token 上限（留空=不限） */
   swarmflowBudget: number | null;
   /**
-   * 本会话的 worktree 隔离开关（会话级，随 chat.send 下发）。
-   * undefined = 用户未拨过：不随请求发送，后端回退会话持久化值，
-   * 都没有则保持团队模板的 worktree 配置。
-   * 退出 team 模式不清理（重开 swarmflow 时保留用户偏好）。
-   */
-  swarmflowWorktree?: boolean;
-  /**
    * 本会话团队的任务调度模式（会话级，随 chat.send 下发并持久化到会话 metadata）。
    * undefined = 用户未拨过：开关默认关闭（自主模式）。团队建好后不可再改。
    */
@@ -705,6 +734,9 @@ function createEmptyRuntime(
   availableModels: ModelEntry[] = [],
   availableModelGroups: ModelGroup[] = [],
 ): SessionRuntime {
+  const legacyName = sessionId === TRANSIENT_NEW_CONVERSATION_ID ? loadLastLegacyModelName() : null;
+  const legacyModel = availableModels.find((model) => model.model_name === legacyName);
+  const restoreLegacyName = Boolean(legacyName && (legacyModel || availableModels.length === 0));
   const restoredSelection = sessionId === TRANSIENT_NEW_CONVERSATION_ID
     ? resolveNewConversationModelSelection(availableModels, availableModelGroups, loadLastModelSelection())
     : null;
@@ -713,8 +745,10 @@ function createEmptyRuntime(
     : null;
   return {
     mode: loadModeFromStorage(),
-    selectedModelName: restoredModel?.model_name ?? null,
-    selectedModelSelection: restoredSelection,
+    selectedModelName: restoreLegacyName ? legacyName : restoredModel?.model_name ?? null,
+    selectedModelSelection: restoreLegacyName
+      ? legacyModel?.model_id ? { type: 'model', id: legacyModel.model_id } : null
+      : restoredSelection,
     projectDirectory: null,
     persistSession: false,
     contextUsageSnapshot: null,
@@ -868,8 +902,6 @@ interface SessionState {
   applyWorkflowUpdate: (sessionId: string, workflow: WorkflowRun) => void;
   /** 设置/关闭用户配置 enableSwarmflow 与预算 swarmflowBudget（配置态，非视图态） */
   setSwarmflowActive: (sessionId: string, active: boolean, budget?: number | null) => void;
-  /** 设置本会话的 worktree 隔离开关（显式值，随 chat.send 下发并持久化到会话 metadata） */
-  setSwarmflowWorktree: (sessionId: string, enabled: boolean) => void;
   /** 设置本会话团队的任务调度模式（显式值，随 chat.send 下发并持久化到会话 metadata） */
   setTeamDispatchMode: (sessionId: string, mode: TeamDispatchMode) => void;
   /** 设置本会话团队的建队方式（调度模式子开关；显式值，随 chat.send 下发并持久化到会话 metadata） */
@@ -2213,19 +2245,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     });
   },
 
-  setSwarmflowWorktree: (sessionId, enabled) => {
-    set((state) => {
-      const rt = state.runtimes[sessionId];
-      if (!rt) return state;
-      return {
-        runtimes: {
-          ...state.runtimes,
-          [sessionId]: { ...rt, swarmflowWorktree: enabled },
-        },
-      };
-    });
-  },
-
   setTeamDispatchMode: (sessionId, mode) => {
     set((state) => {
       const rt = state.runtimes[sessionId];
@@ -2304,20 +2323,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   setSelectedModelName: (sessionId, name) => {
-    // 注意：这里只更新当次会话的内存态，不再写 MODEL_STORAGE_KEY——
-    // 该 key 专门保存后端配置的默认模型（见 setAvailableModels），
-    // 用户手动切模型不应污染"默认模型"这个标记，否则新建会话会继承到"最后用过的模型"。
+    const currentState = get();
+    if (!currentState.runtimes[sessionId]) return;
+    const model = name
+      ? currentState.availableModels.find((entry) => entry.model_name === name)
+        ?? currentState.chatAvailableModels.find((entry) => entry.model_name === name)
+      : null;
+    const selectionFromName: ModelSelection | null =
+      model?.model_id && model.model_id.trim()
+        ? { type: 'model', id: model.model_id.trim() }
+        : null;
+    // Historical restores and runtime updates must not change the next chat's cache.
+    // MODEL_STORAGE_KEY remains reserved for the configured backend default.
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
-      const model = name
-        ? state.availableModels.find((entry) => entry.model_name === name)
-          ?? state.chatAvailableModels.find((entry) => entry.model_name === name)
-        : null;
-      const selectionFromName: ModelSelection | null =
-        model?.model_id && model.model_id.trim()
-          ? { type: 'model', id: model.model_id.trim() }
-          : null;
       return {
         runtimes: {
           ...state.runtimes,
@@ -2335,13 +2355,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         },
       };
     });
+    if (sessionId === TRANSIENT_NEW_CONVERSATION_ID && model && name) {
+      if (!selectionFromName) cacheLastLegacyModelName(name);
+      else if (loadLastLegacyModelName()) cacheLastModelSelection(selectionFromName);
+    }
   },
 
   setSelectedModelSelection: (sessionId, selection) => {
+    if (!get().runtimes[sessionId]) return;
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
-      if (selection) cacheLastModelSelection(selection);
       let selectedModelName = runtime.selectedModelName;
       if (selection?.type === 'model') {
         const model = state.availableModels.find((entry) => entry.model_id === selection.id)
@@ -2361,5 +2385,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         },
       };
     });
+    if (sessionId === TRANSIENT_NEW_CONVERSATION_ID && selection) cacheLastModelSelection(selection);
   },
 }));
