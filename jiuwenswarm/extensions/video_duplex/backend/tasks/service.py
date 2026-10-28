@@ -125,6 +125,13 @@ class TaskService:
         def same_scope(t):
             return (t["owner"], t["session"]) == (task["owner"], task["session"])
 
+        # A saved chat owns one Agent/context/output lease, including independent jobs.
+        if task["session"].startswith("task-duplex:") and any(
+            same_scope(t) and t["id"] != task["id"] and t in active
+            for t in tasks
+        ):
+            return False
+
         if not request.get("independent", False) and any(
             same_scope(t)
             and t["id"] != task["id"]
@@ -165,7 +172,9 @@ class TaskService:
             sequence=1,
             position=time.time_ns(),
             created_at=time.time(),
-            core_session_id="managed-task-" + task_id,
+            core_session_id=(session.removeprefix("task-duplex:")
+                             if session.startswith("task-duplex:")
+                             else "managed-task-" + task_id),
             request_id="task-" + uuid.uuid4().hex,
             changes=[],
             progress=[],
@@ -471,10 +480,10 @@ class TaskService:
         task.update(status="queued", resume_answer=True)
 
     async def answer(
-        self, owner, session, task_id, command_id, interaction_id, *, answers
+        self, owner, session, task_id, command_id, interaction_id, *, answers, native_ui=False
     ):
-        """Answer only a server-observed information question; never an approval."""
-        from .interactions import validate_answers
+        """Bind an answer to the exact observed question and execution."""
+        from .interactions import validate_answers, validate_native_approval_answers, NATIVE_APPROVAL_SOURCES
 
         self.start()
         with self.store.transaction() as db:
@@ -495,11 +504,16 @@ class TaskService:
                 or interaction.get("id") != interaction_id
             ):
                 raise ValueError("Question is no longer pending for this task")
-            answers = validate_answers(interaction, answers)
+            if interaction.get("source") in NATIVE_APPROVAL_SOURCES:
+                if not native_ui:
+                    raise ValueError("Approval requires the native user interface")
+                answers = validate_native_approval_answers(interaction, answers)
+            else:
+                answers = validate_answers(interaction, answers)
             interaction.update(
                 state="accepted", answers=answers, operation_id=command_id
             )
-            suspended = interaction["source"] == "ask_user_interrupt"
+            suspended = interaction["source"] in {"ask_user_interrupt", *NATIVE_APPROVAL_SOURCES}
             if suspended and task["output_closed"] and task["execution_settled"]:
                 self._queue_answer(task)
             elif not suspended:
