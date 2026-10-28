@@ -33,6 +33,7 @@ from gateway.cron.models import (
 from gateway.cron.proactive_cron_sync import PROACTIVE_JOB_ID
 from gateway.cron.scheduler import CronSchedulerService, _cron_next_push_dt
 from gateway.cron.store_base import CronJobStoreBackend
+from jiuwenswarm.common.scheduled_task_policy import is_scheduled_task_supported
 
 
 # 列表/调度等批量路径查询"项目准入"闸门时的最大并发数。
@@ -47,8 +48,8 @@ def _login_credential_ref_from_session(auth_session: str) -> str:
     创建请求连接上的登录会话（``_auth_session``，由 web handler 注入）。
     没有可用会话时明确拒绝，不留一个到点必失败的任务。
     """
-    from jiuwenswarm.common.auth.login_credentials import credential_ref_for_user
-    from jiuwenswarm.common.auth.service import ModelAuthRequired, live_session
+    from gateway.auth.login_credentials import credential_ref_for_user
+    from gateway.auth.service import ModelAuthRequired, live_session
 
     try:
         session = live_session(auth_session or None, allow_refresh=False)
@@ -175,13 +176,17 @@ class CronController:
         if self._target_channel is None and not raw_s:
             raise ValueError("targets is required when target_channel is not set")
         if not raw_s:
-            return normalize_target_channel_id(self._target_channel.value)
-        if not is_valid_target_channel_id(raw_s):
-            raise ValueError(
-                "targets must be one of tui/web/feishu/dingtalk/whatsapp/wecom/xiaoyi/wechat"
-                " or feishu_enterprise:<app_id>"
-            )
-        return normalize_target_channel_id(raw_s)
+            target = normalize_target_channel_id(self._target_channel.value)
+        else:
+            if not is_valid_target_channel_id(raw_s):
+                raise ValueError(
+                    "targets must be one of tui/web/feishu/dingtalk/whatsapp/wecom/wechat"
+                    " or feishu_enterprise:<app_id>"
+                )
+            target = normalize_target_channel_id(raw_s)
+        if not is_scheduled_task_supported(target):
+            raise ValueError(f"targets does not support scheduled tasks: {target}")
+        return target
 
     @classmethod
     def _normalize_description(cls, description: str, name: str) -> str:

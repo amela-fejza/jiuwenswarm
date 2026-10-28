@@ -6,7 +6,7 @@
 
 import { useOrganizationConversationKey } from '../../features/teamOrganization/conversation';
 import { useTranslation } from 'react-i18next';
-import { useChatStore, useSessionStore, useTodoStore } from '../../stores';
+import { conversationKey, useChatStore, useSessionStore, useTodoStore } from '../../stores';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Info } from 'lucide-react';
 import { useSessionArtifacts, useSessionArtifactsCount } from '../ArtifactsPanel';
@@ -406,6 +406,7 @@ export function ToolPanel({
     loadingTeamHistorySessionRef.current = sessionId;
     void loadTeamHistoryPanelState(sessionId, controller.signal)
       .then(historyState => {
+        if (controller.signal.aborted) return;
         loadingTeamHistorySessionRef.current = null;
         hydratedTeamHistorySessionRef.current = sessionId;
         const current = useSessionStore.getState().runtimes[sessionId];
@@ -440,6 +441,13 @@ export function ToolPanel({
         if (mergedExecutionEvents.length > 0) {
           setTeamMemberExecutionEvents(sessionId, mergedExecutionEvents);
         }
+        for (const [teamId, events] of Object.entries(historyState.organizationExecutionEvents ?? {})) {
+          const key = conversationKey(sessionId, teamId);
+          const store = useSessionStore.getState();
+          store.ensureRuntime(key);
+          const live = useSessionStore.getState().runtimes[key]?.teamMemberExecutionEvents ?? [];
+          setTeamMemberExecutionEvents(key, mergeById(events, live, executionEventKey));
+        }
 
         const mergedHumanShareCommands = mergeById(
           historyState.humanShareCommands,
@@ -453,7 +461,8 @@ export function ToolPanel({
         setTeamHistoryMessages(sessionId, historyState.messages);
       })
       .catch(error => {
-        loadingTeamHistorySessionRef.current = null;
+        if (controller.signal.aborted) return;
+        if (loadingTeamHistorySessionRef.current === sessionId) loadingTeamHistorySessionRef.current = null;
         if (error instanceof DOMException && error.name === 'AbortError') {
           return;
         }
@@ -462,6 +471,7 @@ export function ToolPanel({
 
     return () => {
       controller.abort();
+      if (loadingTeamHistorySessionRef.current === sessionId) loadingTeamHistorySessionRef.current = null;
     };
   }, [
     isConnected,
