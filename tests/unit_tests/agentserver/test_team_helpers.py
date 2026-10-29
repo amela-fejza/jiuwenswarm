@@ -4704,7 +4704,14 @@ async def test_process_team_message_stream_does_not_emit_evolution_status_for_no
 
 
 @pytest.mark.anyio
-async def test_consume_stream_with_query_broadcasts_leader_and_teammate_outputs(monkeypatch):
+async def test_consume_stream_with_query_broadcasts_leader_and_teammate_outputs(monkeypatch, tmp_path):
+    from jiuwenswarm.server.runtime.session import session_history
+    from jiuwenswarm.server.runtime.session.session_token_usage import SessionTokenUsageLedger
+
+    monkeypatch.setattr(session_history, "get_agent_sessions_dir", lambda: tmp_path)
+    ledger = SessionTokenUsageLedger(tmp_path / "sess-leader-only", "sess-leader-only")
+    ledger.record("call-leader", "main", 100, 20)
+    ledger.record("call-member", "others", 50, 10)
     broadcasted: list[dict] = []
     ready_calls: list[tuple[str, str]] = []
 
@@ -4811,6 +4818,10 @@ async def test_consume_stream_with_query_broadcasts_leader_and_teammate_outputs(
     )
 
     assert ready_calls == [("sess-leader-only", "demo-team")]
+    for event in broadcasted:
+        if event["event_type"] == "chat.final":
+            assert event["session_usage"]["main"]["input_tokens"] == 100
+            assert event["session_usage"]["others"]["output_tokens"] == 10
     # Leader finals are content events, not Team round terminals.  The runtime
     # may emit several of them before team.completed; only the framework
     # terminal or a terminal-less stream close produces
@@ -7339,8 +7350,12 @@ async def test_broadcast_team_state_snapshot_replays_mirrored_workflow_members(m
 
 
 @pytest.mark.anyio
-async def test_broadcast_team_state_snapshot_skips_run_member_colliding_with_db(monkeypatch):
-    """A DB member already covering a run member id is not emitted twice."""
+@pytest.mark.parametrize("colliding_field", ["members", "departed_members"])
+async def test_broadcast_team_state_snapshot_skips_run_member_colliding_with_db(monkeypatch, colliding_field):
+    """A DB member already covering a run member id is not emitted twice.
+
+    A departed DB member still owns its id, so it blocks the replay too.
+    """
     broadcast_events: list[dict] = []
     run = WorkflowRunState(
         id="run-1",
@@ -7368,14 +7383,14 @@ async def test_broadcast_team_state_snapshot_skips_run_member_colliding_with_db(
     class _FakeMonitorHandler:
         @staticmethod
         async def get_team_snapshot():
-            return {
+            snapshot = {
                 "team_id": "team-snapshot-test",
-                "members": [
-                    {"member_id": "agent1", "status": "ready"},
-                    {"member_id": "run-1:a-claude", "status": "busy"},
-                ],
+                "members": [{"member_id": "agent1", "status": "ready"}],
+                "departed_members": [],
                 "tasks": [],
             }
+            snapshot[colliding_field].append({"member_id": "run-1:a-claude", "status": "busy"})
+            return snapshot
 
     class _FakeManager:
         @staticmethod

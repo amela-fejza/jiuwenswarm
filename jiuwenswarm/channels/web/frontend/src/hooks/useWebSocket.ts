@@ -149,6 +149,7 @@ import { useAgentCatalogStore } from '../stores/agentCatalogStore';
 import { readAgentTemplateName } from '../features/agentIdentity';
 import { normalizeTeamLeaderIdentity } from '../features/teamLeaderIdentity';
 import { normalizeTeamGroupIdentity } from '../features/teamGroupIdentity';
+import { isDepartedTeamMemberStatus, reconcileSnapshotRoster } from '../features/teamMemberDeparture';
 import { NEW_CONVERSATION_ID } from '../multi-session/state/newConversationLifecycle';
 import { toTaskTimelineEntry } from '../components/teamArea/groupChatTimeline';
 
@@ -1184,11 +1185,10 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     (payload: Record<string, unknown>, eventType?: string): string | null => {
       const payloadSessionId = getPayloadSessionId(payload);
       if (!payloadSessionId) return null;
-      const stoppedRootOutput = String(payload.source ?? '').startsWith('org_root_')
-        && isOrganizationOwnerStopped(payloadSessionId);
+      const stoppedOwnerOutput = isOrganizationOwnerStopped(payloadSessionId);
       const incrementalOutput = ['chat.delta', 'chat.reasoning', 'chat.tool_call', 'chat.tool_result']
         .includes(eventType ?? '');
-      if (stoppedRootOutput && incrementalOutput) return null;
+      if (stoppedOwnerOutput && incrementalOutput) return null;
       if (expertTeamId(payload, payloadSessionId)) return null;
       ensureSessionRuntimes(payloadSessionId);
       if (typeof payload.execution_id === 'string' && payload.execution_id) {
@@ -1344,7 +1344,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     const requestState = { revision: 0, changedMemberIds: new Set<string>() };
     teamMemberSnapshotRequestRef.current.set(sessionId, requestState);
     try {
-      const response = await request<{ members?: unknown; members_source?: string }>(
+      const response = await request<{ members?: unknown; departed_members?: unknown; members_source?: string }>(
         'team.snapshot',
         { session_id: sessionId },
         { timeoutMs: 5000 },
@@ -1354,12 +1354,16 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         requestState.revision !== 0
       ) return;
       if (response?.members_source !== 'live') return;
-      if (!Array.isArray(response?.members) || response.members.length === 0) return;
+      if (!Array.isArray(response?.members)) return;
+      // 旧后端不带 departed_members；新后端在队友全部离队时 members 为空，靠它收敛。
+      const rawDepartedMembers = Array.isArray(response.departed_members) ? response.departed_members : [];
+      if (response.members.length === 0 && rawDepartedMembers.length === 0) return;
       const runtime = useSessionStore.getState().getRuntime(sessionId);
       if (runtime?.mode !== 'team') return;
 
       const timestamp = Date.now();
-      const snapshotMembers = response.members.flatMap((item) => {
+      const knownMembers = [...runtime.teamMembers, ...(runtime.teamDepartedMembers ?? [])];
+      const toSnapshotMembers = (items: unknown[]) => items.flatMap((item) => {
         if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
         const snapshotMember = item as Record<string, unknown>;
         const memberId = typeof snapshotMember.member_id === 'string'
@@ -1367,7 +1371,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           : '';
         const status = typeof snapshotMember.status === 'string' ? snapshotMember.status : '';
         if (!memberId || !status) return [];
-        const existing = runtime.teamMembers.find((member) => member.member_id === memberId);
+        const existing = knownMembers.find((member) => member.member_id === memberId);
         return [{
           id: existing?.id ?? `team-snapshot-${memberId}`,
           member_id: memberId,
@@ -1398,31 +1402,30 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               : existing?.display_name,
         }];
       });
-      if (snapshotMembers.length !== response.members.length || snapshotMembers.length === 0) return;
+      const snapshotMembers = toSnapshotMembers(response.members);
+      if (snapshotMembers.length !== response.members.length) return;
+      // 旧后端把离队成员混在 members 里，这里与 departed_members 合成同一份离队目录。
+      const departedMembers = [
+        ...toSnapshotMembers(rawDepartedMembers),
+        ...snapshotMembers.filter((member) => isDepartedTeamMemberStatus(member.status)),
+      ];
 
       const changedMemberIds = requestState.changedMemberIds;
-      const reconciledMemberIds = snapshotMembers
-        .filter((member) => !changedMemberIds.has(member.member_id))
-        .map((member) => member.member_id);
-      if (reconciledMemberIds.length === 0) return;
-
-      const snapshotMemberIds = new Set(snapshotMembers.map((member) => member.member_id));
-      const members = snapshotMembers.flatMap((member) => {
-        if (!changedMemberIds.has(member.member_id)) return [member];
-        const currentMember = runtime.teamMembers.find(
-          (candidate) => candidate.member_id === member.member_id
-        );
-        return currentMember ? [currentMember] : [];
-      });
-      for (const member of runtime.teamMembers) {
-        if (changedMemberIds.has(member.member_id) && !snapshotMemberIds.has(member.member_id)) {
-          members.push(member);
-        }
-      }
+      const reconciled = reconcileSnapshotRoster(
+        snapshotMembers,
+        new Set(departedMembers.map((member) => member.member_id)),
+        runtime.teamMembers,
+        changedMemberIds,
+      );
+      if (!reconciled) return;
+      const { members, reconciledMemberIds } = reconciled;
 
       const currentRuntime = useSessionStore.getState().getRuntime(sessionId);
       if (currentRuntime?.mode !== 'team') return;
       useSessionStore.getState().setTeamMembers(sessionId, members);
+      for (const member of departedMembers) {
+        useSessionStore.getState().rememberDepartedTeamMember(sessionId, member);
+      }
       if (changedMemberIds.size === 0) {
         useSessionStore.getState().clearTeamConnectionPresentation(sessionId);
       } else {
@@ -2503,6 +2506,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           timestamp: new Date().toISOString(),
         });
       }
+      let restoreOwnerProcessing: (() => void) | undefined;
       try {
         const params: Record<string, unknown> = {
           session_id: sessionId,
@@ -2516,6 +2520,17 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           params.intent = 'cancel';
           params.target_team_id = ownerStopTarget;
           params.organization_owner_stop = true;
+          const foregroundWasProcessing = Boolean(
+            useChatStore.getState().getRuntime(sessionId)?.foregroundIsProcessing,
+          );
+          const ownerWasStopped = isOrganizationOwnerStopped(sessionId);
+          restoreOwnerProcessing = () => {
+            setOrganizationOwnerStopped(sessionId, ownerWasStopped);
+            useChatStore.getState().setProcessing(sessionId, foregroundWasProcessing);
+          };
+          // Stop the Owner composer immediately while children finish independently.
+          setOrganizationOwnerStopped(sessionId, true, true);
+          closeActiveTeamLeaderMessages(sessionId);
         }
         if (['pause', 'resume', 'cancel', 'supplement'].includes(intent)) {
           // 出站 mode 与普通消息/队列重发同一套组合逻辑（resolveOutgoingMode）：
@@ -2538,7 +2553,11 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           Object.assign(params, useSessionStore.getState().getOutgoingModelParams(sessionId));
         }
         const result = await request<{ success?: boolean }>('chat.interrupt', params);
-        if (result?.success === false) return false;
+        if (result?.success === false) {
+          restoreOwnerProcessing?.();
+          return false;
+        }
+        if (ownerStopTarget) setOrganizationOwnerStopped(sessionId, true);
         if (intent === 'supplement' || intent === 'resume') {
           setOrganizationOwnerStopped(sessionId, false);
           clearConnectionPresentationForUserAction(sessionId);
@@ -2549,6 +2568,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         }
         return true;
       } catch (error) {
+        restoreOwnerProcessing?.();
         const webError = error as WebError;
         onErrorRef.current?.(webError.message || t('network.interruptFailed'));
         return false;
@@ -2579,8 +2599,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   const cancel = useCallback(
     async (sessionId: string) => {
       try {
+        const ownerOnly = Boolean(organizationOwnerStopTarget(sessionId));
         const succeeded = await interrupt(sessionId, 'cancel');
-        if (succeeded) {
+        if (succeeded && !ownerOnly) {
           useSubagentStore.getState().markRunningSubagentsCancelled(sessionId);
         }
       } catch (error) {
@@ -3040,12 +3061,15 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       const sessionStore = useSessionStore.getState();
       const runtime = sessionStore.getRuntime(sessionId);
       const currentMembers = runtime?.teamMembers ?? [];
+      const departed = currentMembers.find((member) => member.member_id === normalizedMemberId);
+      if (!departed) {
+        return;
+      }
       const nextMembers = currentMembers.filter(
         (member) => member.member_id !== normalizedMemberId
       );
-      if (nextMembers.length === currentMembers.length) {
-        return;
-      }
+      // 离开名册但保留身份：它做过的任务卡片还要按 member_id 显示名字 / 头像。
+      sessionStore.rememberDepartedTeamMember(sessionId, { ...departed, status: 'shut_down' });
       clearPendingTeamMemberContextCompressionStart(sessionId, normalizedMemberId);
       clearTeamMemberContextCompressionStatus(sessionId, normalizedMemberId);
       sessionStore.setTeamMembers(sessionId, nextMembers);
@@ -3438,6 +3462,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         }
       }),
       webClient.on('chat.final', ({ payload }) => {
+        if (payload.session_usage) {
+          useSessionStore.getState().receiveSessionTokenUsage(payload.session_usage);
+        }
         if (shouldIgnoreSessionOutput(payload)) return;
         // Supplemental requests never own a separate answer or task lifecycle.
         if (handleTaskInputReceipt('chat.final', payload)) return;
@@ -4650,6 +4677,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         usePlanStore.getState().setActive(sessionId, false);
       }),
       webClient.on('chat.processing_status', ({ payload }) => {
+        if (payload.session_usage) {
+          useSessionStore.getState().receiveSessionTokenUsage(payload.session_usage);
+        }
         // Organization background rounds own their lifecycle in useOrganizationEvents.
         // They must not close a concurrent foreground Owner request.
         if (isTeamOrganizationUiEnabled() && String(payload.source ?? '').startsWith('org_') &&
@@ -4667,6 +4697,8 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         // 加载历史消息时忽略处理状态更新
         if (useChatStore.getState().getRuntime(sessionId)?.isLoadingHistory) return;
         const isProcessingNow = Boolean(payload.is_processing);
+        // Delayed foreground status must not relight an explicitly stopped Owner.
+        if (isProcessingNow && isOrganizationOwnerStopped(sessionId)) return;
 
         // 服务器在跨会话执行前先推送带原始问题的 processing=true。把它显式
         // 追加为一个新 user turn，并关闭可能残留的旧 stream 游标；历史消息本身
@@ -5164,6 +5196,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         }
       }),
       webClient.on('chat.subtask_update', ({ payload }) => {
+        useSessionStore.getState().receiveSessionTokenUsage((payload as { session_usage?: unknown }).session_usage);
         const event = normalizeSubagentStatusEvent(payload);
         if (!event) return;
         let pendingAssignment = pendingSubagentAssignmentRef.current.get(event.subagent.subagent_id);
@@ -5472,9 +5505,6 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             clearPendingTeamConnectionMember(sessionId, memberId);
             useSessionStore.getState().clearTeamConnectionPresentation(sessionId, memberId);
           }
-          if (e.type === 'team.task.created' && e.task_id) {
-            useSessionStore.getState().registerConfirmedTeamTaskCreation(sessionId, e.task_id);
-          }
           useSessionStore.getState().addTeamTaskEvent(sessionId, {
             id: `task-${Date.now()}`,
             type: e.type || '',
@@ -5594,6 +5624,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (!sessionId) {
           console.log('[usage_summary] filtered by session check');
           return;
+        }
+        if (payload.session_usage) {
+          useSessionStore.getState().receiveSessionTokenUsage(payload.session_usage);
         }
         const usage = payload.usage as UsageSummary | undefined;
         if (!usage) {

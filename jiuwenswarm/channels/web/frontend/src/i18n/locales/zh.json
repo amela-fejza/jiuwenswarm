@@ -47,7 +47,7 @@
     "work": "任务",
     "agent": "专家",
     "design": "设计",
-    "experiments": "实验",
+    "experiments": "RSI",
     "sessions": "会话",
     "cron": "定时任务",
     "skills": "技能",
@@ -102,6 +102,8 @@
       "notImplemented": "未实现",
       "send": "发送",
       "running": "设计团长正在执行…",
+      "stop": "停止",
+      "stopError": "停止失败，请稍后重试。",
       "attach": "添加参考素材",
       "removeAttachment": "移除参考素材",
       "attachHint": "支持图片、视频、音频。最多 5 张图、1 个视频、1 段音频。",
@@ -970,7 +972,7 @@
       "a2ui_enabled": { "title": "启用 A2UI", "description": "允许将支持的结果渲染成交互式界面。" },
       "rsi_enabled": {
         "title": "启用 RSI",
-        "description": "显示侧边栏「实验」入口，可创建并查看 Harness 优化和产物优化（论文、程序）实验；关闭后隐藏该入口。"
+        "description": "显示侧边栏「RSI」入口，可创建并查看 Harness 优化和产物优化（论文、程序）的 RSI 任务；关闭后隐藏该入口。"
       },
       "trajectory_ui_diagnosis_enabled": {
         "title": "启用轨迹诊断",
@@ -999,6 +1001,10 @@
       "team_member_messaging_enabled": {
         "title": "启用成员间通信",
         "description": "允许成员之间直接发送消息（点对点、多播、广播），无需经 Leader 转达；任务指派与交接仍由 Leader 和调度框架负责。"
+      },
+      "team_member_subtasks_enabled": {
+        "title": "允许成员拆分子任务",
+        "description": "成员可以把正在执行的任务拆成子任务，交给自己或其他已有成员。拆分后原任务暂停，子任务全部结束后带着结果恢复执行。子任务最多嵌套 2 层。"
       },
       "task_full_duplex_enabled": {
         "title": "启用任务对话全双工入口",
@@ -1149,8 +1155,9 @@
       "noteLabel": "用户反馈：描述已选轨迹中的问题（可选）",
       "fullScopeBusy": "会话运行中，无法诊断完整轨迹",
       "cancel": "取消诊断",
-      "selectionHint": "在时间轴或任一泳道上拖选一段时间，并勾选要诊断的成员。",
-      "includeAgent": "诊断 {{name}}",
+      "selectionHint": "在时间轴上拖选范围，或用「全选」选中某 Agent 的全部轨迹；已选中时可用勾选框取消该 Agent 的选区。",
+      "includeAgent": "已选中：{{name}}",
+      "includeAgentHint": "取消勾选可清除 {{name}} 的当前选区",
       "timeAxis": "时间轴",
       "records": "诊断记录",
       "noRecords": "还没有诊断记录",
@@ -1168,6 +1175,7 @@
         "interrupted": "已中断"
       },
       "outletsPending": "诊断完成后在这里给出优化建议",
+      "detailsPending": "评估结果和诊断发现会显示在这里",
       "stageStatus": {
         "pending": "等待中",
         "running": "进行中",
@@ -1191,8 +1199,10 @@
       "suggestions": "诊断建议",
       "noSuggestions": "本次诊断没有可执行的优化建议",
       "details": "诊断详情",
+      "resultTabs": "诊断详情和诊断建议",
+      "suggestionsReady": "已有建议",
       "dismiss": "关闭提示",
-      "note": "诊断说明",
+      "note": "用户反馈",
       "object": "诊断对象",
       "objectAgents": "Agent",
       "objectFull": "全部轨迹",
@@ -1257,6 +1267,8 @@
       "objectExcludedRunning": "诊断时有 {{count}} 个步骤仍在运行，未纳入诊断",
       "objectTask": "任务描述",
       "objectSummary": "轨迹摘要",
+      "sectionExpand": "展开",
+      "sectionCollapse": "收起",
       "findingCauses": "{{count}} 条产物归因",
       "findingSkill": "{{count}} 条技能归因",
       "findingExperience": "{{count}} 条经验归因",
@@ -1278,6 +1290,9 @@
       "ttseTriggeredNotice": "已触发TTSE，将在后台完成经验生成和保存",
       "ttseReady": "可生成经验",
       "skillFillPrefix": "根据以下优化建议对相应skill进行演进：",
+      "skillSelectAll": "全选",
+      "skillSelectOne": "选择 {{name}}",
+      "skillFillSelected": "填入所选（{{count}}）",
       "artifactFillPrefix": "请根据以下建议进行优化：",
       "ttseResult": {
         "triggered": "已触发",
@@ -1762,6 +1777,12 @@
       "tools": "工具及连接器",
       "skills": "技能",
       "notReported": "未报告",
+      "cumulativeTitle": "累计 Token",
+      "mainAgentTokens": "主 Agent",
+      "otherAgentTokens": "子 Agent / 团队成员",
+      "inputTokens": "输入",
+      "outputTokens": "输出",
+      "partialReported": "部分调用未上报用量",
       "close": "关闭上下文详情",
       "noBreakdown": "后端未返回分类明细"
     },
@@ -2336,7 +2357,6 @@
       "builtinPathPlaceholder": "内置 CLI（自动管理）",
       "installNow": "一键安装",
       "notInstalledHint": "暂未检测到SDK，请点击",
-      "removePath": "从历史记录中删除该路径",
       "savedHint": "已保存",
       "detectSucceeded": "检测成功",
       "editPath": "编辑",
@@ -3774,7 +3794,7 @@
       "connectionUnavailable": "依赖的连接器尚未连接，请先连接后再使用",
       "connectorUnavailableNamed": "该专家依赖的连接器「{{connector}}」尚未连接，请先完成连接后再重试安装。",
       "uploadSuccess": "专家包 {{id}} 已导入，请在我的专家中查看",
-      "uploadImportedInstallFailed": "专家包 {{id}} 已导入，但安装失败，请在我的专家中重试安装",
+      "installOutcomeUnknown": "网络中断，安装结果未确认。专家包已保留，可稍后在我的专家中重试安装。",
       "uploadError": "上传并导入专家失败，请检查文件后重试",
       "uploadMissingManifest": "专家包缺少 manifest.json，或文件已损坏",
       "uploadMissingReadme": "专家包缺少 README.md 文件",
@@ -4033,6 +4053,12 @@
     "forkFromMessage": "从此消息新建会话分支",
     "forkFromMessageFailed": "新建会话分支失败，请重试。",
     "fileExpired": "已过期",
+    "saveSkill": "保存",
+    "saveSkillSaving": "保存中...",
+    "saveSkillSaved": "已保存",
+    "saveSkillSuccess": "保存成功",
+    "saveSkillNoSession": "当前无活跃会话，无法保存 Skill",
+    "saveSkillOverwriteConfirm": "{{message}}\n是否覆盖保存？",
     "fileTypeDocument": "文档",
     "fileTypeSpreadsheet": "电子表格",
     "fileTypePresentation": "演示文件",
@@ -5085,18 +5111,18 @@
     }
   },
   "rsi": {
-    "title": "实验",
-    "createExperiment": "创建实验",
+    "title": "RSI",
+    "createExperiment": "创建 RSI 任务",
     "empty": {
-      "title": "暂无实验任务",
-      "hint": "我们支持创建Harness优化、论文优化和程序优化实验"
+      "title": "暂无 RSI 任务",
+      "hint": "支持创建 Harness 优化、论文优化和程序优化的 RSI 任务"
     },
     "intro": {
       "title": "RSI·递归自我改进",
       "lead": "让AI越用越强—从「会干活」到「越干越好」",
       "stepsTitle": "操作步骤",
-      "step1Title": "第一步：创建实验",
-      "step1Body": "选择实验场景：Harness 优化 / 产物优化（论文、程序），填写必要参数，点击「确定」，开始自动优化。",
+      "step1Title": "第一步：创建 RSI 任务",
+      "step1Body": "选择优化场景：Harness 优化 / 产物优化（论文、程序），填写必要参数，点击「创建」，开始自动优化。",
       "step2Title": "第二步：可视化优化过程",
       "step2Body": "实时可视训练进度条和得分曲线。 RSI 树搜索可视化，理解自动探索过程。全程自动迭代，无需人工干预。",
       "step3Title": "第三步：获得最优结果",
@@ -5108,15 +5134,15 @@
       "feature2Body": "把你的成品（论文 / 程序）交给 AI 反复打磨：生成多个优化候选，逐版检验评分，保留最好的一版继续迭代，直到产出最满意的那一版再交付给你。经过多轮打磨自动完成，质量稳步上升"
     },
     "list": {
-      "title": "RSI自进化实验",
+      "title": "RSI 任务",
       "loading": "加载中…",
-      "error": "加载实验列表失败"
+      "error": "加载 RSI 任务列表失败"
     },
     "createDialog": {
-      "title": "创建实验",
-      "nameLabel": "实验名称",
-      "namePlaceholder": "请输入实验名称",
-      "typeLabel": "实验类型",
+      "title": "创建 RSI 任务",
+      "nameLabel": "任务名称",
+      "namePlaceholder": "请输入任务名称",
+      "typeLabel": "任务类型",
       "typeHarness": "Harness 优化",
       "typeArtifact": "产物优化",
       "artifactSubtypeLabel": "产物子类型",
@@ -5161,7 +5187,7 @@
       "cancel": "取消",
       "infoBar": "请预先安装、调用evolve-design技能，创建产物优化的依赖项，填写程序路径",
       "validation": {
-        "nameRequired": "请输入实验名称",
+        "nameRequired": "请输入任务名称",
         "datasetRequired": "请选择数据集文件",
         "optimizerRequired": "请选择优化模型",
         "testerRequired": "请选择测试模型",
@@ -5262,13 +5288,13 @@
       "nodeId": "节点 ID",
       "nodeType": "生命周期",
       "close": "关闭",
-      "deleteTitle": "删除实验",
-      "deleteBody": "删除后实验数据不可恢复，确定删除该实验吗？",
-      "pauseTitle": "暂停实验",
-      "pauseBody": "暂停后将停止当前优化进程，确定暂停该实验吗？",
-      "stopTitle": "停止任务",
-      "stopBody": "停止后将终止当前优化任务，确定停止该实验吗？",
-      "queuedTitle": "本实验正在排队中",
+      "deleteTitle": "删除 RSI 任务",
+      "deleteBody": "删除后 RSI 任务数据不可恢复，确定删除该任务吗？",
+      "pauseTitle": "暂停 RSI 任务",
+      "pauseBody": "暂停后将停止当前优化进程，确定暂停该 RSI 任务吗？",
+      "stopTitle": "停止 RSI 任务",
+      "stopBody": "停止后将终止当前优化任务，确定停止该 RSI 任务吗？",
+      "queuedTitle": "当前 RSI 任务正在排队",
       "queuedHint": "下面还有 1 个任务正在优化中，请耐心等待"
     },
     "stage": {

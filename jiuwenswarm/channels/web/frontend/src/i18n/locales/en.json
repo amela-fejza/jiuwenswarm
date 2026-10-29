@@ -47,7 +47,7 @@
     "work": "Tasks",
     "agent": "Experts",
     "design": "Design",
-    "experiments": "Experiments",
+    "experiments": "RSI",
     "sessions": "Sessions",
     "cron": "Scheduled Tasks",
     "skills": "Skills",
@@ -102,6 +102,8 @@
       "notImplemented": "Not implemented",
       "send": "Send",
       "running": "The design leader is working…",
+      "stop": "Stop",
+      "stopError": "Could not stop. Please try again.",
       "attach": "Add reference media",
       "removeAttachment": "Remove reference",
       "attachHint": "Images, video, or audio. Up to 5 images, 1 video, and 1 audio file.",
@@ -986,7 +988,7 @@
       "a2ui_enabled": { "title": "Enable A2UI", "description": "Render supported results as interactive interfaces." },
       "rsi_enabled": {
         "title": "Enable RSI",
-        "description": "Show the Experiments entry in the sidebar for Harness optimization and artifact optimization (papers and programs). Turn it off to hide the entry."
+        "description": "Show the RSI entry in the sidebar to create and view RSI tasks for Harness optimization and artifact optimization (papers and programs). Turn it off to hide the entry."
       },
       "trajectory_ui_diagnosis_enabled": {
         "title": "Enable trajectory diagnosis",
@@ -1015,6 +1017,10 @@
       "team_member_messaging_enabled": {
         "title": "Enable member-to-member messaging",
         "description": "Members can message each other directly (point-to-point, multicast, broadcast) instead of routing through the Leader. Task assignment and handoffs stay with the Leader and the scheduler."
+      },
+      "team_member_subtasks_enabled": {
+        "title": "Allow members to split tasks",
+        "description": "Members can split the task they are working on into subtasks for themselves or other existing members. The task pauses until its subtasks finish, then resumes with their results. Subtasks can nest up to 2 levels."
       },
       "task_full_duplex_enabled": {
         "title": "Enable Full-duplex in task chat",
@@ -1165,8 +1171,9 @@
       "noteLabel": "User feedback: describe issues in the selected range (optional)",
       "fullScopeBusy": "The session is running; the full trajectory cannot be diagnosed",
       "cancel": "Cancel diagnosis",
-      "selectionHint": "Drag a range on the time axis or any lane, and check the members to diagnose.",
-      "includeAgent": "Diagnose {{name}}",
+      "selectionHint": "Drag a range on the time axis, or use Select all for one agent's whole lane. When selected, uncheck the box to clear that agent's pick.",
+      "includeAgent": "Selected: {{name}}",
+      "includeAgentHint": "Uncheck to clear {{name}}'s current selection",
       "timeAxis": "Time axis",
       "records": "Diagnosis records",
       "noRecords": "No diagnosis yet",
@@ -1184,6 +1191,7 @@
         "interrupted": "Interrupted"
       },
       "outletsPending": "Suggestions appear here once the diagnosis finishes",
+      "detailsPending": "The evaluation and findings show up here",
       "stageStatus": {
         "pending": "Waiting",
         "running": "Running",
@@ -1207,8 +1215,10 @@
       "suggestions": "Diagnosis suggestions",
       "noSuggestions": "This diagnosis has no actionable suggestions",
       "details": "Diagnosis details",
+      "resultTabs": "Diagnosis details and suggestions",
+      "suggestionsReady": "Suggestions ready",
       "dismiss": "Dismiss",
-      "note": "Diagnosis note",
+      "note": "User feedback",
       "object": "Diagnosis target",
       "objectAgents": "Agents",
       "objectFull": "Entire trajectory",
@@ -1273,6 +1283,8 @@
       "objectExcludedRunning": "{{count}} steps were still running when the diagnosis started and are not included",
       "objectTask": "Task",
       "objectSummary": "Trajectory summary",
+      "sectionExpand": "Expand",
+      "sectionCollapse": "Collapse",
       "findingCauses": "{{count}} artifact finding(s)",
       "findingSkill": "{{count}} skill finding(s)",
       "findingExperience": "{{count}} experience finding(s)",
@@ -1294,6 +1306,9 @@
       "ttseTriggeredNotice": "TTSE has been triggered and will finish generating and saving the experience in the background",
       "ttseReady": "Experience available",
       "skillFillPrefix": "Evolve the relevant skill according to the following suggestions:",
+      "skillSelectAll": "Select all",
+      "skillSelectOne": "Select {{name}}",
+      "skillFillSelected": "Fill selected ({{count}})",
       "artifactFillPrefix": "Optimize according to the following suggestions:",
       "ttseResult": {
         "triggered": "Triggered",
@@ -1778,6 +1793,12 @@
       "tools": "Tools & Connectors",
       "skills": "Skills",
       "notReported": "Not reported",
+      "cumulativeTitle": "Cumulative tokens",
+      "mainAgentTokens": "Main Agent",
+      "otherAgentTokens": "Subagents / team members",
+      "inputTokens": "Input",
+      "outputTokens": "Output",
+      "partialReported": "Some calls did not report usage",
       "close": "Close context details",
       "noBreakdown": "No category details returned by the backend"
     },
@@ -2352,7 +2373,6 @@
       "builtinPathPlaceholder": "Built-in CLI (managed)",
       "installNow": "Install",
       "notInstalledHint": "No SDK detected yet. Click",
-      "removePath": "Remove this path from history",
       "savedHint": "Saved",
       "detectSucceeded": "Detection passed",
       "editPath": "Edit",
@@ -3797,7 +3817,7 @@
       "connectionUnavailable": "Required connectors are not connected yet. Connect them before use.",
       "connectorUnavailableNamed": "This Expert requires the connector “{{connector}}”, which is not connected. Connect it and try again.",
       "uploadSuccess": "Expert package {{id}} was imported. Review it in My Experts.",
-      "uploadImportedInstallFailed": "Expert package {{id}} was imported, but installation failed. Try installing it again in My Experts.",
+      "installOutcomeUnknown": "The connection dropped before the install result was confirmed. The package is kept — retry the install from My Experts later.",
       "uploadError": "Unable to upload and import the Expert package. Check the file and try again.",
       "uploadMissingManifest": "The Expert package is missing manifest.json, or the file is corrupt.",
       "uploadMissingReadme": "The Expert package is missing README.md.",
@@ -4059,6 +4079,12 @@
     "forkFromMessage": "Create a conversation branch from this message",
     "forkFromMessageFailed": "Failed to create a conversation branch. Try again.",
     "fileExpired": "Expired",
+    "saveSkill": "Save",
+    "saveSkillSaving": "Saving...",
+    "saveSkillSaved": "Saved",
+    "saveSkillSuccess": "Saved successfully",
+    "saveSkillNoSession": "No active conversation. The Skill cannot be saved.",
+    "saveSkillOverwriteConfirm": "{{message}}\nOverwrite the existing Skill?",
     "fileTypeDocument": "Document",
     "fileTypeSpreadsheet": "Spreadsheet",
     "fileTypePresentation": "Presentation",
@@ -5113,17 +5139,17 @@
     }
   },
   "rsi": {
-    "title": "Experiments",
-    "createExperiment": "Create Experiment",
+    "title": "RSI",
+    "createExperiment": "Create RSI Task",
     "empty": {
-      "title": "No experiment tasks",
-      "hint": "We support creating Harness, paper, and program optimization experiments"
+      "title": "No RSI tasks",
+      "hint": "Create RSI tasks for Harness, paper, and program optimization"
     },
     "intro": {
       "title": "RSI · Recursive Self-Improvement",
       "lead": "Make AI stronger with use—from simply working to working better",
       "stepsTitle": "How it works",
-      "step1Title": "Step 1: Create an experiment",
+      "step1Title": "Step 1: Create an RSI task",
       "step1Body": "Choose Harness Optimization or Artifact Optimization (paper or program), fill in the required parameters, and click Create to start automatic optimization.",
       "step2Title": "Step 2: Visualize the optimization",
       "step2Body": "Track training progress and score curves in real time. Explore the RSI tree search and let the process iterate automatically without manual intervention.",
@@ -5136,15 +5162,15 @@
       "feature2Body": "Give your paper or program to AI for repeated polishing. It generates optimization candidates, validates and scores every version, keeps the best one, and iterates until the highest-quality deliverable is ready."
     },
     "list": {
-      "title": "RSI experiments",
+      "title": "RSI Tasks",
       "loading": "Loading…",
-      "error": "Failed to load experiments"
+      "error": "Failed to load RSI tasks"
     },
     "createDialog": {
-      "title": "Create Experiment",
-      "nameLabel": "Experiment name",
-      "namePlaceholder": "Enter experiment name",
-      "typeLabel": "Experiment type",
+      "title": "Create RSI Task",
+      "nameLabel": "Task name",
+      "namePlaceholder": "Enter task name",
+      "typeLabel": "Task type",
       "typeHarness": "Harness Optimization",
       "typeArtifact": "Artifact Optimization",
       "artifactSubtypeLabel": "Artifact subtype",
@@ -5189,7 +5215,7 @@
       "cancel": "Cancel",
       "infoBar": "Please pre-install and invoke the evolve-design skill, create artifact optimization dependencies, and fill in the program path.",
       "validation": {
-        "nameRequired": "Please enter experiment name",
+        "nameRequired": "Please enter task name",
         "datasetRequired": "Please select dataset file",
         "optimizerRequired": "Please select optimizer model",
         "testerRequired": "Please select tester model",
@@ -5282,7 +5308,7 @@
       "failureReason": "Failure reason",
       "rejectionReason": "Why it was not adopted",
       "inheritFrom": "Inherited from",
-      "baselineDescription": "This is the starting version for the experiment.",
+      "baselineDescription": "This is the starting version for the optimization.",
       "noChangeSummary": "Inherited from the parent; no structured change summary is available.",
       "nodeArtifact": "Node artifact",
       "processing": "Processing…",
@@ -5290,13 +5316,13 @@
       "nodeId": "Node ID",
       "nodeType": "Lifecycle",
       "close": "Close",
-      "deleteTitle": "Delete experiment",
-      "deleteBody": "Experiment data cannot be restored after deletion. Delete this experiment?",
-      "pauseTitle": "Pause experiment",
-      "pauseBody": "The current optimization will stop. Pause this experiment?",
-      "stopTitle": "Stop task",
-      "stopBody": "Stopping will terminate the current optimization task. Stop this experiment?",
-      "queuedTitle": "This experiment is queued",
+      "deleteTitle": "Delete RSI task",
+      "deleteBody": "RSI task data cannot be restored after deletion. Delete this task?",
+      "pauseTitle": "Pause RSI task",
+      "pauseBody": "The current optimization will stop. Pause this RSI task?",
+      "stopTitle": "Stop RSI task",
+      "stopBody": "Stopping will terminate the current optimization task. Stop this RSI task?",
+      "queuedTitle": "This RSI task is queued",
       "queuedHint": "1 more task is optimizing. Please wait."
     },
     "stage": {

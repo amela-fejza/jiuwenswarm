@@ -7265,7 +7265,7 @@ class AgentWebSocketServer:
         params = request.params if isinstance(request.params, dict) else {}
         session_id = str(params.get("session_id") or request.session_id or "").strip()
         channel_id = request.channel_id or "web"
-        empty_payload = {"members": [], "tasks": [], "team_id": None}
+        empty_payload = {"members": [], "departed_members": [], "tasks": [], "team_id": None}
 
         # ``team_name`` 显式指定了要看的 team（team 选择器切 team 时就是这么调的）。
         requested_team_name = str(params.get("team_name") or "").strip()
@@ -7937,9 +7937,11 @@ class AgentWebSocketServer:
         """返回 team human_agent 席位列表供 /join 校验。
 
         纯查询透传：mismatch 校验与对外文案均在 gateway，server 只查 member、过滤
-        human_agent、回 ok/members。查不到或异常 → ok=False（payload 不带文案，由
-        gateway 拼"team 不存在"）。
+        human_agent、回 ok/members。已离队（``shut_down``）的席位不再投递消息，
+        与 ``team.snapshot`` 同口径剔除。查不到或异常 → ok=False（payload 不带文案，
+        由 gateway 拼"team 不存在"）。
         """
+        from jiuwenswarm.agents.harness.team.member_status import is_departed_member
         from jiuwenswarm.server.runtime.agent_adapter.team_helpers import (
             query_team_human_members_for_join,
         )
@@ -7959,7 +7961,10 @@ class AgentWebSocketServer:
             members_raw = []
         members = [
             m for m in members_raw
-            if isinstance(m, dict) and m.get("role") == "human_agent" and m.get("member_id")
+            if isinstance(m, dict)
+            and m.get("role") == "human_agent"
+            and m.get("member_id")
+            and not is_departed_member(m.get("status"))
         ]
         resp = AgentResponse(
             request_id=request.request_id,
@@ -8609,6 +8614,14 @@ class AgentWebSocketServer:
                 )
             next_seq += 1
 
+        session_usage = None
+        if not subagent_id and isinstance(session_id, str) and session_id.strip():
+            from jiuwenswarm.server.control.history_service import load_history_session_usage
+
+            session_usage = await asyncio.to_thread(
+                load_history_session_usage, session_id.strip()
+            )
+
         done_payload: dict[str, Any] = {
             "event_type": "history.message",
             "status": "done",
@@ -8622,6 +8635,9 @@ class AgentWebSocketServer:
             "snapshot_id": snapshot_id,
             "snapshot_end": snapshot_end,
         }
+        usage_revision = session_usage.get("revision") if isinstance(session_usage, dict) else None
+        if isinstance(usage_revision, int) and not isinstance(usage_revision, bool) and usage_revision > 0:
+            done_payload["session_usage"] = session_usage
         # Parent history cold-start: advertise on-disk subagent buckets so the
         # frontend can fetch per-subagent transcripts even when parent history
         # never persisted chat.subtask_update roster frames (GitCode #4887).
