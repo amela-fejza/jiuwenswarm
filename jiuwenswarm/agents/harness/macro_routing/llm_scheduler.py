@@ -16,6 +16,10 @@ from jiuwenswarm.agents.harness.macro_routing.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Classification only needs the task intent. A pasted file or long document
+# should not be sent in full to the scheduler model.
+_QUERY_PROMPT_LIMIT = 2000
+
 
 def _extract_json(text: str) -> dict[str, Any]:
     if not text:
@@ -44,6 +48,14 @@ def _extract_json(text: str) -> dict[str, Any]:
     return {}
 
 
+def _prompt_query(query: str) -> str:
+    """Keep the classifier prompt bounded to the start of the user task."""
+    text = str(query or "").strip()
+    if len(text) <= _QUERY_PROMPT_LIMIT:
+        return text
+    return f"{text[:_QUERY_PROMPT_LIMIT].rstrip()}\n…[truncated]"
+
+
 def _build_prompt(query: str, gate: MacroRoutingDecision) -> str:
     return f"""You are a lightweight execution-mode scheduler.
 Pick ONE top-level mode for this user task.
@@ -59,7 +71,7 @@ Gate suggestion (may be uncertain):
 mode={gate.mode}, confidence={gate.confidence:.2f}, rationale={gate.rationale}
 
 User task:
-{query}
+{_prompt_query(query)}
 """
 
 

@@ -8,12 +8,38 @@ import pytest
 
 from jiuwenswarm.agents.harness.macro_routing.config import load_macro_routing_config
 from jiuwenswarm.agents.harness.macro_routing.gate import route_with_gate
+from jiuwenswarm.agents.harness.macro_routing.llm_scheduler import (
+    _QUERY_PROMPT_LIMIT,
+    _build_prompt,
+)
 from jiuwenswarm.agents.harness.macro_routing.router import route_macro_mode
 from jiuwenswarm.agents.harness.macro_routing.schemas import (
     MACRO_MODES,
+    MacroRoutingDecision,
     is_auto_mode,
     normalize_macro_mode,
 )
+
+
+def test_scheduler_prompt_truncates_long_query():
+    gate = MacroRoutingDecision(
+        mode="agent",
+        confidence=0.4,
+        rationale="uncertain",
+        source="rules",
+        gate_confident=False,
+    )
+    short = "Fix the login button"
+    long = "x" * (_QUERY_PROMPT_LIMIT + 500)
+
+    short_prompt = _build_prompt(short, gate)
+    long_prompt = _build_prompt(long, gate)
+
+    assert short in short_prompt
+    assert "…[truncated]" not in short_prompt
+    assert long not in long_prompt
+    assert long[:_QUERY_PROMPT_LIMIT] in long_prompt
+    assert long_prompt.endswith("…[truncated]\n")
 
 
 def test_normalize_and_auto_aliases():
