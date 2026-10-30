@@ -365,10 +365,6 @@ def conflict_fingerprint(conflict: Conflict) -> str:
         "type": conflict.conflict_type,
         "tasks": list(conflict.task_ids),
         "members": list(conflict.member_names),
-        "event_type": conflict.evidence.event_type,
-        "timestamp": conflict.evidence.timestamp,
-        "previous": conflict.evidence.previous,
-        "current": conflict.evidence.current,
     }
     return json.dumps(payload, sort_keys=True, default=str)
 

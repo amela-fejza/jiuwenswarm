@@ -294,6 +294,7 @@ def test_permission_violation_resets_only_a_blank_resettable_task() -> None:
     noted = _snapshot([_task(status="in_progress", assignee="leader", summary="kept")])
     missing = _snapshot([_task(status="in_progress", assignee="ghost")])
     pending = _snapshot([_task(status="pending", assignee="leader")])
+    in_review = _snapshot([_task(status="in_review", assignee="leader")])
 
     leader_conflict = detect_conflicts(leader_owned)[0]
     assert leader_conflict.conflict_type == PERMISSION_VIOLATION
@@ -304,6 +305,7 @@ def test_permission_violation_resets_only_a_blank_resettable_task() -> None:
     assert DeterministicRecovery().propose(detect_conflicts(missing)[0], missing).kind is DecisionKind.APPLY
     assert DeterministicRecovery().propose(detect_conflicts(noted)[0], noted).kind is DecisionKind.ESCALATE
     assert DeterministicRecovery().propose(detect_conflicts(pending)[0], pending).kind is DecisionKind.ESCALATE
+    assert DeterministicRecovery().propose(detect_conflicts(in_review)[0], in_review).kind is DecisionKind.ESCALATE
 
 
 async def test_service_resets_duplicate_work_once() -> None:
@@ -485,6 +487,42 @@ async def test_rejected_reset_is_escalated_and_not_retried() -> None:
     assert first[0].decision.kind is DecisionKind.ESCALATE
     assert first[0].applied is False
     assert second == []
+
+
+async def test_rejected_reset_is_not_retried_after_new_event_metadata() -> None:
+    class RejectingSource(FakeSource):
+        async def reset_task(self, task_id: str) -> bool:
+            self.reset_ids.append(task_id)
+            return False
+
+    source = RejectingSource([_task(status="planning")], _roster(_member("alpha", status="shut_down")))
+    service = _service(source)
+
+    first = await service.scan()
+    second = await service.handle_event(
+        _event(MonitorEventType.TASK_UPDATED, task_id="unrelated-task", timestamp=2)
+    )
+
+    assert source.reset_ids == ["task-1"]
+    assert first[0].decision.kind is DecisionKind.ESCALATE
+    assert second == []
+    assert len(service.journal) == 1
+
+
+def test_member_event_does_not_replace_task_event_evidence() -> None:
+    snapshot = _snapshot([_task()])
+
+    fold_monitor_event(
+        snapshot,
+        _event(MonitorEventType.TASK_UPDATED, task_id="task-1", timestamp=1),
+    )
+    fold_monitor_event(
+        snapshot,
+        _event(MonitorEventType.MEMBER_STATUS_CHANGED, member_name="alpha", timestamp=2),
+    )
+
+    assert snapshot.last_event_type == MonitorEventType.TASK_UPDATED.value
+    assert snapshot.last_event_timestamp == 1
 
 
 def test_conflict_fingerprint_is_stable() -> None:

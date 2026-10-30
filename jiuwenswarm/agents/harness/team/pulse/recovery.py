@@ -19,7 +19,6 @@ from typing import Protocol
 from jiuwenswarm.agents.harness.team.pulse.models import (
     DUPLICATE_ACTIVE,
     PERMISSION_VIOLATION,
-    RESETTABLE_TASK_STATUSES,
     STALE_OWNERSHIP,
     UNAVAILABLE_OWNER,
     Conflict,
@@ -127,7 +126,7 @@ def _permission_decision(conflict: Conflict, snapshot: CoordinationSnapshot) -> 
             reason="Permission conflict does not name one task.",
         )
     task = tasks[0]
-    if task.status in RESETTABLE_TASK_STATUSES and _blank(task):
+    if _blank_resettable(task):
         return Decision(
             kind=DecisionKind.APPLY,
             reset_task_ids=(task.task_id,),

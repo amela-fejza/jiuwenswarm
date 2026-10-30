@@ -75,12 +75,12 @@ def fold_monitor_event(snapshot: CoordinationSnapshot, event: Any) -> None:
         return
     type_value = getattr(event_type, "value", str(event_type))
     timestamp = getattr(event, "timestamp", None)
-    snapshot.last_event_type = str(type_value)
-    snapshot.last_event_timestamp = timestamp if isinstance(timestamp, int) else None
 
     task_id = getattr(event, "task_id", None)
     if not isinstance(task_id, str) or not task_id:
         return
+    snapshot.last_event_type = str(type_value)
+    snapshot.last_event_timestamp = timestamp if isinstance(timestamp, int) else None
     member_name = getattr(event, "member_name", None)
     member = member_name.strip() if isinstance(member_name, str) and member_name.strip() else None
 
